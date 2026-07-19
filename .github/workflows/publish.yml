@@ -1,0 +1,105 @@
+name: publish
+on:
+  push:
+    tags:
+      - 'v*'
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+      - run: npm install -g npm@latest
+      - run: npm ci --no-audit --no-fund
+      - run: npm test
+      # Auth via an org/repo Actions secret NPM_TOKEN (a granular automation
+      # token with publish rights to @dir-ai/*). An org-level secret makes every
+      # future dir-ai/* repo publish with zero per-package setup. Provenance is
+      # still attached (id-token: write above). If NPM_TOKEN is absent, OIDC
+      # trusted publishing is used instead (configure it on npmjs.com).
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          # Fail loudly if the secret didn't reach the job (empty token).
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then
+            echo "::error::NPM_TOKEN secret is empty/not visible to this repo — set it as a repo secret."
+            exit 1
+          fi
+          # Strip any stray whitespace/newline from the pasted secret — a trailing
+          # \n makes the Authorization header illegal ("not a legal HTTP header value").
+          NODE_AUTH_TOKEN="$(printf '%s' "$NODE_AUTH_TOKEN" | tr -d '[:space:]')"
+          export NODE_AUTH_TOKEN
+          V=$(node -p "require('./package.json').version")
+          if npm view "@dir-ai/voyager-browser@$V" version >/dev/null 2>&1; then
+            echo "@dir-ai/voyager-browser@$V already on npm — skipping"
+            exit 0
+          fi
+          # npm sometimes returns a client-side 404/5xx even though the registry
+          # accepted the PUT (a race with the provenance transparency-log write).
+          # On failure, wait and verify whether the version actually landed before
+          # failing the job.
+          if npm publish --provenance --access public; then
+            echo "published @dir-ai/voyager-browser@$V"
+          else
+            echo "npm publish returned nonzero — verifying whether it landed anyway…"
+            for i in 1 2 3 4 5 6; do
+              sleep 10
+              if npm view "@dir-ai/voyager-browser@$V" version >/dev/null 2>&1; then
+                echo "@dir-ai/voyager-browser@$V is live despite the client error — treating as success"
+                exit 0
+              fi
+            done
+            echo "::error::publish failed and @dir-ai/voyager-browser@$V is not on the registry"
+            exit 1
+          fi
+      - name: Sync server.json version to the tag
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          jq --arg v "$VERSION" '.version=$v | .packages[0].version=$v' server.json > server.tmp && mv server.tmp server.json
+      - name: Install mcp-publisher
+        run: curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+      - name: Authenticate to the MCP registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+      - name: Publish server to the MCP registry
+        run: ./mcp-publisher publish
+  docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build (amd64) for smoke
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: voyager-browser:smoke
+      - name: Smoke — help renders inside the image
+        run: docker run --rm voyager-browser:smoke --version
+      - name: Version from tag
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/dir-ai/voyager-browser:${{ steps.ver.outputs.version }}
+            ghcr.io/dir-ai/voyager-browser:latest

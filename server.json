@@ -1,0 +1,27 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.dir-ai/voyager-browser",
+  "description": "Voyager's web-page sense: safe read-only observation of one live URL (structure, security, a11y).",
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@dir-ai/voyager-browser",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "valueHint": "subcommand",
+          "value": "mcp"
+        }
+      ]
+    }
+  ],
+  "repository": {
+    "url": "https://github.com/dir-ai/voyager-browser",
+    "source": "github"
+  }
+}

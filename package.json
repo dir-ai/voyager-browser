@@ -1,0 +1,29 @@
+{
+  "name": "@dir-ai/voyager-browser",
+  "version": "0.1.0",
+  "description": "Voyager's web-page sense: a safe, read-only observation of ONE live URL — structure, forms, links, scripts, security posture (CSP/HSTS/mixed-content) and accessibility signals. Static HTML, no JS execution, no headless browser.",
+  "type": "module",
+  "license": "MIT",
+  "author": "dir-ai",
+  "homepage": "https://github.com/dir-ai/voyager-browser#readme",
+  "repository": { "type": "git", "url": "git+https://github.com/dir-ai/voyager-browser.git" },
+  "bugs": { "url": "https://github.com/dir-ai/voyager-browser/issues" },
+  "keywords": ["ai-agents", "web", "accessibility", "security", "voyager", "model-context-protocol"],
+  "bin": { "voyager-browser": "dist/cli.js" },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "files": ["dist/", "README.md", "LICENSE"],
+  "publishConfig": { "access": "public" },
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build",
+    "test": "npm run build && tsc -p tsconfig.test.json && node --test scripts/run-tests.mjs"
+  },
+  "dependencies": {
+    "@dir-ai/voyager": "^1.1.1",
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": { "@types/node": "^20.0.0", "typescript": "^5.5.0" }
+}
