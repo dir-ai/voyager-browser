@@ -1,6 +1,6 @@
 {
   "name": "@dir-ai/voyager-browser",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Voyager's web-page sense: a safe, read-only observation of ONE live URL — structure, forms, links, scripts, security posture (CSP/HSTS/mixed-content) and accessibility signals. Static HTML, no JS execution, no headless browser.",
   "type": "module",
   "license": "MIT",

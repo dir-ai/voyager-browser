@@ -2,7 +2,7 @@ import { lookup as dnsLookupCb } from 'node:dns'
 import { promisify } from 'node:util'
 import { blockedIpReason, parseUrl } from './authorize.js'
 import { safeGet } from './fetch.js'
-import { extractStructure } from './html.js'
+import { extractStructure, clean } from './html.js'
 import type { ObserveOptions, PageBrief, PageFinding, RenderMode, SecurityPosture } from './types.js'
 
 const dnsLookup = promisify(dnsLookupCb)
@@ -137,7 +137,8 @@ export async function observe(input: string, opts: ObserveOptions = {}): Promise
   const hstsMaxAge = Number(/max-age\s*=\s*(\d+)/i.exec(hstsStr)?.[1] ?? 0)
   const hstsWeak = Boolean(hstsStr) && (hstsMaxAge < 15_552_000 || !/includesubdomains/i.test(hstsStr))
   const frameAncestors = /frame-ancestors/i.test(cspStr)
-  const versionLeakRaw = [h('server'), h('x-powered-by')].filter((s) => s && /\d/.test(s)).join('; ')
+  // Server/X-Powered-By are target-controlled → clean before they enter a finding.
+  const versionLeakRaw = [h('server'), h('x-powered-by')].filter((s) => s && /\d/.test(s)).map((s) => clean(s, 120)).join('; ')
 
   const mixedContent = https ? collectMixedContent(html, url) : []
   const thirdPartyScripts = structure.scriptOrigins.filter((o) => o !== url.origin)

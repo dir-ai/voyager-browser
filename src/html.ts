@@ -79,6 +79,20 @@ export function extractStructure(html: string, pageUrl: URL): {
     .slice(0, 40)
     .map((m) => ({ level: Number(m[1]), text: frame(m[2].replace(/<[^>]+>/g, ' ')) }))
 
+  // Honor <base href>: relative URLs resolve against IT, not the page URL. A
+  // hostile <base href="http://attacker/"> would otherwise make attacker-hosted
+  // resources look same-origin (or hide external ones). Resolve with `base`, but
+  // still judge "external" against the PAGE's origin.
+  let base = pageUrl
+  const baseHref = attr(noComments.match(/<base\b[^>]*>/i)?.[0] ?? '', 'href')
+  if (baseHref) {
+    try {
+      base = new URL(baseHref, pageUrl)
+    } catch {
+      /* keep pageUrl */
+    }
+  }
+
   // Scripts from comment-stripped html (need the tags), before script bodies go away.
   const scripts = [...noComments.matchAll(/<script\b[^>]*>/gi)].map((m) => m[0])
   const scriptOrigins = new Set<string>()
@@ -88,7 +102,7 @@ export function extractStructure(html: string, pageUrl: URL): {
     const src = attr(s, 'src')
     if (src) {
       try {
-        const o = new URL(src, pageUrl)
+        const o = new URL(src, base)
         scriptOrigins.add(o.origin)
         if (o.origin !== pageUrl.origin && !attr(s, 'integrity')) externalNoSri++ // SRI missing on 3rd-party
       } catch {
@@ -127,7 +141,7 @@ export function extractStructure(html: string, pageUrl: URL): {
     const actionRaw = attr(open, 'action') ?? ''
     let actionUrl: URL | null = null
     try {
-      actionUrl = new URL(actionRaw || pageUrl.toString(), pageUrl)
+      actionUrl = new URL(actionRaw || pageUrl.toString(), base)
     } catch {
       /* keep null → treated as same-page */
     }
@@ -150,11 +164,11 @@ export function extractStructure(html: string, pageUrl: URL): {
     const hrefRaw = attr(m[0], 'href') ?? ''
     let external = false
     try {
-      external = new URL(hrefRaw, pageUrl).origin !== pageUrl.origin
+      external = new URL(hrefRaw, base).origin !== pageUrl.origin
     } catch {
       /* relative/malformed → internal */
     }
-    const targetBlank = (attr(m[0], 'target') ?? '') === '_blank'
+    const targetBlank = (attr(m[0], 'target') ?? '').toLowerCase() === '_blank'
     const rel = (attr(m[0], 'rel') ?? '').toLowerCase()
     const unsafeBlank = targetBlank && external && !/noopener|noreferrer/.test(rel)
     return { href: clean(hrefRaw, 300), external, unsafeBlank }

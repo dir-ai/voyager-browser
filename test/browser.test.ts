@@ -154,3 +154,16 @@ test('SRI: third-party script without integrity is counted', () => {
   const { structure } = extractStructure(html, new URL('https://me.test/'))
   assert.equal(structure.externalScriptsNoSri, 1)
 })
+
+test('Kimi: <base href> is honored — a hostile base makes relative URLs external', () => {
+  const html = '<html><head><base href="http://attacker.test/"></head><body><a href="/inside">x</a><script src="/app.js"></script><form action="/login"><input type="password" name="pw"></form></body></html>'
+  const { links, structure, forms } = extractStructure(html, new URL('https://victim.test/'))
+  assert.equal(links[0].external, true, 'a relative link under a hostile <base> resolves to the attacker (external)')
+  assert.ok(structure.scriptOrigins.includes('http://attacker.test'))
+  assert.equal(forms[0].crossOrigin, true) // the form now posts to the attacker origin
+})
+
+test('Kimi: target="_BLANK" (any case) is caught for reverse-tabnabbing', () => {
+  const { links } = extractStructure('<a href="https://other.test/x" target="_BLANK">x</a>', new URL('https://me.test/'))
+  assert.equal(links[0].unsafeBlank, true)
+})
