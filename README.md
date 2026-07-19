@@ -64,19 +64,28 @@ console.log(brief.findings)   // severity + described fix
 
 ## What it looks for
 
-- **Security** — plain HTTP, missing HSTS / CSP / `nosniff`, mixed content on an HTTPS page, insecure cookies.
-- **Forms** — a form on HTTPS posting to plain HTTP (`critical`), a sensitive form (password/payment) posting cross-origin or over HTTP.
+- **Security posture (quality, not just presence)** — plain HTTP; missing/**weak** HSTS; missing CSP or a CSP graded weak (`unsafe-inline`/`unsafe-eval`/wildcard/no `object-src`/no `base-uri`); missing clickjacking protection (X-Frame-Options / `frame-ancestors`); missing `nosniff`, Referrer-Policy, Permissions-Policy; version-leaking `Server`/`X-Powered-By`; mixed content on an HTTPS page (origin-compared, not prefix); **per-cookie** Secure/HttpOnly; third-party scripts without **Subresource Integrity**.
+- **Forms** — a form on HTTPS posting to plain HTTP (`critical`); a sensitive form (password/payment) posting cross-origin or over HTTP; a sensitive `POST` with no anti-CSRF token; sensitive data on `GET`.
 - **Links** — external `target="_blank"` without `rel="noopener"` (reverse-tabnabbing).
 - **Accessibility** — missing `<html lang>`, images without `alt`, skipped heading levels, unlabeled form fields.
+- **Render honesty** — a `render: static | hybrid | client-heavy` field: if a page's content is JavaScript-rendered, the brief says so and marks itself PARTIAL rather than reporting a shell as clean.
 - **Composition hints** — third-party script origins to vet with `@dir-ai/voyager` / `@dir-ai/voyager-net`.
 
 ## Safety
 
 - **Read-only.** Fetches the page with a single GET; never submits, clicks, or mutates.
 - **No code execution.** Static HTML parsing only — the page's JavaScript is never run.
-- **SSRF-gated.** Only `http(s)`; a single URL (no lists/credentials); the resolved IP is screened, and **every redirect hop is re-vetted** — a redirect to a private/metadata address is refused.
-- **Untrusted by construction.** All page text is injection-stripped and framed; the agent must treat it as data, not instructions.
-- **Honest limits.** It reads what the server sends. It does not see client-rendered state, and it says so.
+- **SSRF-gated, with IP pinning.** Only `http(s)`; a single URL (no lists/credentials). The host is resolved, every address is classified canonically (IPv4-mapped IPv6, unspecified, CGNAT, NAT64, link-local, private, loopback, metadata all refused), and the connection is **pinned to the vetted IP** so DNS rebinding cannot swap in an internal address between the check and the fetch. **Every redirect hop is re-vetted and re-pinned.**
+- **Untrusted by construction.** Every owner-controlled string that reaches the brief — title, headings, meta, links, form actions, field names — is injection-stripped and framed; the agent must treat it as data, not instructions.
+- **Bounded.** One deadline covers headers **and** body; the body is byte-capped; a truncated read downgrades confidence and is never reported as "clean".
+- **Honest limits.** It reads what the server sends. It does not see client-rendered state — and the `render` field says exactly how much it saw.
+
+## Roadmap
+
+- **v0.3** — same-origin JS-bundle static scan (exposed secrets/endpoints/source-maps), third-party/tracker/cookie inventory + tech fingerprinting, WCAG-mapped a11y depth, and a `CognitiveClaim` adapter so a page observation drops into a `@dir-ai/voyager-agent` mission (page → host → dependency chain).
+- **v1.0** — an opt-in, consent-gated `--render` sandboxed headless pass (network-isolated, resource-capped) for true SPA/rendered-DOM coverage, always labeled as render-mode output; a stable finding-`kind` taxonomy and a full posture score.
+
+The line stays fixed: voyager-browser expands by **reading more of what's already served**, never by *doing more to the server*. Anything active (submitting, fuzzing, probing) belongs to a separate consent-gated organ.
 
 ## The Voyager family
 

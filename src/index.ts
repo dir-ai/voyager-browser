@@ -11,6 +11,6 @@ export { parseUrl, blockedIpReason } from './authorize.js'
 export { frame, extractStructure } from './html.js'
 export type {
   PageBrief, PageFinding, PageForm, FormField, PageLink, PageStructure,
-  SecurityPosture, Framed, Severity, Confidence, ObserveOptions,
+  SecurityPosture, RenderMode, Framed, Severity, Confidence, ObserveOptions,
 } from './types.js'
 export { VERSION } from './version.js'

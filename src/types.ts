@@ -36,6 +36,8 @@ export interface PageForm {
   fields: FormField[]
   /** True when the form collects a password / payment-like field. */
   sensitive: boolean
+  /** True when a hidden CSRF/anti-forgery token field is present. */
+  hasCsrfToken: boolean
 }
 
 export interface PageLink {
@@ -53,24 +55,50 @@ export interface PageStructure {
   /** Distinct origins of <script src>. */
   scriptOrigins: string[]
   inlineScripts: number
+  /** Third-party <script src> without Subresource Integrity (supply-chain surface). */
+  externalScriptsNoSri: number
   imgCount: number
   imgMissingAlt: number
   metaDescription: Framed | null
   viewport: string | null
+  /** <meta generator> value, if any (tech-stack hint). */
+  generator: string | null
+  /** Visible (tag-stripped) text length — feeds render-mode detection. */
+  visibleTextLength: number
+  /** A single SPA mount node (#root/#app/#__next…) was found. */
+  hasMountNode: boolean
 }
 
 export interface SecurityPosture {
   https: boolean
   hsts: boolean
+  /** HSTS present but weak (max-age too low / no includeSubDomains). */
+  hstsWeak: boolean
   csp: boolean
+  /** Specific CSP weaknesses, e.g. 'unsafe-inline', 'wildcard-src', 'no-object-src'. */
+  cspWeaknesses: string[]
   xContentTypeOptions: boolean
   referrerPolicy: boolean
+  /** Clickjacking protection: X-Frame-Options or CSP frame-ancestors. */
+  frameProtection: boolean
+  /** Cross-origin isolation headers. */
+  coop: boolean
+  corp: boolean
+  permissionsPolicy: boolean
+  /** Version-leaking Server / X-Powered-By value, if present. */
+  versionLeak: string | null
   /** http:// sub-resources referenced from an https page. */
   mixedContent: string[]
   /** Distinct third-party script origins (not the page origin). */
   thirdPartyScripts: string[]
-  setCookieInsecure: boolean
+  /** Per-cookie: names of cookies missing Secure/HttpOnly. */
+  insecureCookies: string[]
 }
+
+/** How much of the page a static fetch actually saw. `client-heavy` means most
+ *  content is rendered by JavaScript that voyager-browser does NOT execute — an
+ *  honest signal so an agent knows it is looking at a shell, not the real page. */
+export type RenderMode = 'static' | 'hybrid' | 'client-heavy'
 
 export interface PageBrief {
   target: { input: string; url: string | null; origin: string | null }
@@ -78,6 +106,11 @@ export interface PageBrief {
   fetchedAt: number
   status: number | null
   contentType: string | null
+  /** How much of the page the static fetch saw — honesty signal for SPAs. */
+  render: RenderMode
+  renderConfidence: Confidence
+  /** True when the observed body was cut at the byte cap (partial observation). */
+  truncated: boolean
   /** One-line, honest summary. */
   summary: string
   structure: PageStructure | null

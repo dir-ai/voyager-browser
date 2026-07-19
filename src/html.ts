@@ -9,6 +9,13 @@ export function frame(raw: string): Framed {
   return { text: cleaned, stripped: cleaned !== collapsed ? 1 : 0 }
 }
 
+/** Neutralize an owner-controlled string that enters structured output (href,
+ *  action, field name/type, viewport, lang). Keeps it a plain string but strips
+ *  injection payloads so raw page text never reaches the agent as instructions. */
+export function clean(raw: string, max = 300): string {
+  return stripInjection(decodeEntities(raw).slice(0, max)).trim()
+}
+
 const ENTITIES: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", '#39': "'", nbsp: ' ' }
 function decodeEntities(s: string): string {
   return s.replace(/&(#\d+|#x[0-9a-f]+|[a-z]+);/gi, (m, code: string) => {
@@ -27,11 +34,16 @@ function safeFromCode(n: number): string {
   }
 }
 
+// Match an attribute so a `data-`/other prefix cannot masquerade as it: the name
+// must be preceded by the start of string, whitespace, or a quote — never `-`.
 function attr(tag: string, name: string): string | null {
-  const m = tag.match(new RegExp(`\\b${name}\\s*=\\s*("([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i'))
+  const m = tag.match(new RegExp(`(?:^|[\\s"'])${name}\\s*=\\s*("([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i'))
   return m ? (m[2] ?? m[3] ?? m[4] ?? '') : null
 }
 
+function stripComments(html: string): string {
+  return html.replace(/<!--[\s\S]*?-->/g, ' ')
+}
 function stripScriptsAndStyles(html: string): string {
   return html.replace(/<script\b[\s\S]*?<\/script>/gi, ' ').replace(/<style\b[\s\S]*?<\/style>/gi, ' ')
 }
@@ -39,46 +51,59 @@ function stripScriptsAndStyles(html: string): string {
 const SENSITIVE_FIELD = /pass|pwd|card|cvv|cvc|ssn|iban|account|secret|token|otp|pin\b/i
 
 /** Extract the structural signals we reason over — dependency-free, best-effort,
- *  honest. It parses static HTML; it does NOT execute JavaScript or render SPAs. */
+ *  honest. It parses static HTML; it does NOT execute JavaScript or render SPAs.
+ *  Comments and script/style bodies are removed FIRST so commented-out markup and
+ *  code-string look-alikes cannot fabricate (or mask) forms, links, and findings. */
 export function extractStructure(html: string, pageUrl: URL): {
   structure: PageStructure
   forms: PageForm[]
   links: PageLink[]
 } {
-  const text = stripScriptsAndStyles(html)
+  const noComments = stripComments(html) // scripts still present → we need their src
+  const text = stripScriptsAndStyles(noComments) // real, rendered markup only
 
   const titleM = text.match(/<title[^>]*>([\s\S]*?)<\/title>/i)
   const title = titleM ? frame(titleM[1]) : null
-  const htmlTag = html.match(/<html\b[^>]*>/i)?.[0] ?? ''
-  const lang = htmlTag ? attr(htmlTag, 'lang') : null
+  const htmlTag = text.match(/<html\b[^>]*>/i)?.[0] ?? ''
+  const lang = htmlTag ? nz(clean(attr(htmlTag, 'lang') ?? '', 35)) : null
 
-  const metas = [...html.matchAll(/<meta\b[^>]*>/gi)].map((m) => m[0])
+  const metas = [...noComments.matchAll(/<meta\b[^>]*>/gi)].map((m) => m[0])
   const descTag = metas.find((t) => (attr(t, 'name') ?? '').toLowerCase() === 'description')
   const metaDescription = descTag ? frame(attr(descTag, 'content') ?? '') : null
   const viewportTag = metas.find((t) => (attr(t, 'name') ?? '').toLowerCase() === 'viewport')
-  const viewport = viewportTag ? attr(viewportTag, 'content') : null
+  const viewport = viewportTag ? nz(clean(attr(viewportTag, 'content') ?? '', 120)) : null
+  const generatorTag = metas.find((t) => (attr(t, 'name') ?? '').toLowerCase() === 'generator')
+  const generator = generatorTag ? nz(clean(attr(generatorTag, 'content') ?? '', 120)) : null
 
   const headings = [...text.matchAll(/<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>/gi)]
     .slice(0, 40)
     .map((m) => ({ level: Number(m[1]), text: frame(m[2].replace(/<[^>]+>/g, ' ')) }))
 
-  const scripts = [...html.matchAll(/<script\b[^>]*>/gi)].map((m) => m[0])
+  // Scripts from comment-stripped html (need the tags), before script bodies go away.
+  const scripts = [...noComments.matchAll(/<script\b[^>]*>/gi)].map((m) => m[0])
   const scriptOrigins = new Set<string>()
   let inlineScripts = 0
+  let externalNoSri = 0
   for (const s of scripts) {
     const src = attr(s, 'src')
     if (src) {
       try {
-        scriptOrigins.add(new URL(src, pageUrl).origin)
+        const o = new URL(src, pageUrl)
+        scriptOrigins.add(o.origin)
+        if (o.origin !== pageUrl.origin && !attr(s, 'integrity')) externalNoSri++ // SRI missing on 3rd-party
       } catch {
         /* ignore malformed src */
       }
     } else inlineScripts++
   }
 
-  const imgs = [...html.matchAll(/<img\b[^>]*>/gi)].map((m) => m[0])
+  const imgs = [...text.matchAll(/<img\b[^>]*>/gi)].map((m) => m[0])
   const imgCount = imgs.length
   const imgMissingAlt = imgs.filter((t) => attr(t, 'alt') === null).length
+
+  // Signals for honest SPA/client-render detection.
+  const bodyText = text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+  const mountNode = /<(?:div|main)\b[^>]*\bid\s*=\s*["'](?:root|app|__next|__nuxt|q-app|svelte)["']/i.test(text)
 
   const structure: PageStructure = {
     title,
@@ -86,42 +111,42 @@ export function extractStructure(html: string, pageUrl: URL): {
     headings,
     scriptOrigins: [...scriptOrigins],
     inlineScripts,
+    externalScriptsNoSri: externalNoSri,
     imgCount,
     imgMissingAlt,
     metaDescription,
     viewport,
+    generator,
+    visibleTextLength: bodyText.length,
+    hasMountNode: mountNode,
   }
 
-  // Forms
-  const forms: PageForm[] = [...html.matchAll(/<form\b[^>]*>([\s\S]*?)<\/form>/gi)].slice(0, 20).map((m) => {
+  // Forms — from rendered markup only (no comments/scripts).
+  const forms: PageForm[] = [...text.matchAll(/<form\b[^>]*>([\s\S]*?)<\/form>/gi)].slice(0, 20).map((m) => {
     const open = m[0].match(/<form\b[^>]*>/i)?.[0] ?? ''
     const actionRaw = attr(open, 'action') ?? ''
-    let action = pageUrl.toString()
+    let actionUrl: URL | null = null
     try {
-      action = new URL(actionRaw || pageUrl.toString(), pageUrl).toString()
+      actionUrl = new URL(actionRaw || pageUrl.toString(), pageUrl)
     } catch {
-      /* keep page url */
+      /* keep null → treated as same-page */
     }
     const method = (attr(open, 'method') ?? 'get').toUpperCase()
     const fields: FormField[] = [...m[1].matchAll(/<(input|select|textarea)\b[^>]*>/gi)].slice(0, 60).map((f) => ({
-      name: attr(f[0], 'name') ?? '',
-      type: (attr(f[0], 'type') ?? f[1].toLowerCase()).toLowerCase(),
-      required: /\brequired\b/i.test(f[0]),
+      name: clean(attr(f[0], 'name') ?? '', 80),
+      type: clean((attr(f[0], 'type') ?? f[1]).toLowerCase(), 30),
+      required: /(?:^|[\s"'])required(?:[\s>"']|$)/i.test(f[0]),
     }))
-    let actionUrl: URL | null = null
-    try {
-      actionUrl = new URL(action)
-    } catch {
-      /* ignore */
-    }
+    // Security flags computed from the PARSED url; the stored string is cleaned.
     const insecureTarget = pageUrl.protocol === 'https:' && actionUrl?.protocol === 'http:'
     const crossOrigin = actionUrl ? actionUrl.origin !== pageUrl.origin : false
     const sensitive = fields.some((f) => f.type === 'password' || SENSITIVE_FIELD.test(f.name))
-    return { action, method, insecureTarget, crossOrigin, fields, sensitive }
+    const hasCsrfToken = fields.some((f) => f.type === 'hidden' && /csrf|xsrf|token|authenticity|_token|nonce/i.test(f.name))
+    return { action: clean((actionUrl ?? pageUrl).toString(), 300), method, insecureTarget, crossOrigin, fields, sensitive, hasCsrfToken }
   })
 
-  // Links
-  const links: PageLink[] = [...html.matchAll(/<a\b[^>]*>/gi)].slice(0, 500).map((m) => {
+  // Links — from rendered markup only.
+  const links: PageLink[] = [...text.matchAll(/<a\b[^>]*>/gi)].slice(0, 500).map((m) => {
     const hrefRaw = attr(m[0], 'href') ?? ''
     let external = false
     try {
@@ -132,8 +157,12 @@ export function extractStructure(html: string, pageUrl: URL): {
     const targetBlank = (attr(m[0], 'target') ?? '') === '_blank'
     const rel = (attr(m[0], 'rel') ?? '').toLowerCase()
     const unsafeBlank = targetBlank && external && !/noopener|noreferrer/.test(rel)
-    return { href: hrefRaw.slice(0, 300), external, unsafeBlank }
+    return { href: clean(hrefRaw, 300), external, unsafeBlank }
   })
 
   return { structure, forms, links }
+}
+
+function nz(s: string): string | null {
+  return s ? s : null
 }

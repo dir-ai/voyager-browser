@@ -94,3 +94,63 @@ test('observe: refuses a non-http(s) scheme', async () => {
   assert.ok(brief.error)
   assert.match(brief.error!, /http\(s\)/)
 })
+
+// ── Regression tests for the closed adversarial findings ───────────────────
+
+test('SSRF gate (#2/#3): IPv4-mapped IPv6, unspecified, and CGNAT are blocked', () => {
+  for (const bad of [
+    'http://[::ffff:169.254.169.254]/', // maps to metadata
+    'http://[::ffff:7f00:1]/', // maps to 127.0.0.1
+    'http://0.0.0.0/',
+    'http://[::]/',
+    'http://100.64.1.1/', // CGNAT
+    'http://100.100.100.200/', // Alibaba metadata (CGNAT range)
+  ]) {
+    assert.equal(parseUrl(bad).ok, false, `${bad} must be blocked`)
+  }
+  assert.equal(parseUrl('https://example.com').ok, true) // public still allowed
+  assert.equal(blockedIpReason('::ffff:a9fe:a9fe'), 'is a cloud metadata endpoint (SSRF/credential-theft surface)')
+})
+
+test('parser (#5): commented-out and script-embedded markup does NOT fabricate findings', () => {
+  const html = `<html><body>
+    <!-- <form action="http://evil.test/collect" method="post"><input type="password" name="pw"></form> -->
+    <script>var s = '<a href="http://x.evil/" target="_blank">out</a>';</script>
+    <p>real content</p>
+  </body></html>`
+  const { forms, links } = extractStructure(html, new URL('https://site.test/'))
+  assert.equal(forms.length, 0) // commented-out form is gone
+  assert.equal(links.length, 0) // link inside a <script> string is gone
+})
+
+test('parser (#6): data-* attributes cannot masquerade as href/name/src', () => {
+  const { links } = extractStructure('<a data-href="http://internal.evil/x" href="/safe">x</a>', new URL('https://me.test/'))
+  assert.equal(links[0].href, '/safe')
+  assert.equal(links[0].external, false)
+})
+
+test('framing (#7): owner-controlled href/action/field-name reach output injection-stripped', () => {
+  const html = `<a href="/x‮evil">l</a><form action="/a"><input name="user​name"></form>`
+  const { links, forms } = extractStructure(html, new URL('https://me.test/'))
+  assert.ok(!/[‮​]/.test(links[0].href), 'href must be stripped of bidi/zero-width')
+  assert.ok(!/[​]/.test(forms[0].fields[0].name), 'field name must be stripped')
+})
+
+test('form CSRF/hidden-token detection populates hasCsrfToken', () => {
+  const html = `<form method="post" action="/login"><input type="password" name="pw"><input type="hidden" name="csrf_token" value="x"></form>`
+  const { forms } = extractStructure(html, new URL('https://me.test/'))
+  assert.equal(forms[0].sensitive, true)
+  assert.equal(forms[0].hasCsrfToken, true)
+})
+
+test('SPA render detection: an empty shell with a mount node + bundle is client-heavy signal', () => {
+  const { structure } = extractStructure('<html lang="en"><body><div id="root"></div><script src="/app.js"></script></body></html>', new URL('https://spa.test/'))
+  assert.equal(structure.hasMountNode, true)
+  assert.ok(structure.visibleTextLength < 200)
+})
+
+test('SRI: third-party script without integrity is counted', () => {
+  const html = `<script src="https://cdn.other.com/a.js"></script><script src="https://cdn.other.com/b.js" integrity="sha384-x"></script>`
+  const { structure } = extractStructure(html, new URL('https://me.test/'))
+  assert.equal(structure.externalScriptsNoSri, 1)
+})
