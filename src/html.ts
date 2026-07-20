@@ -96,6 +96,7 @@ export function extractStructure(html: string, pageUrl: URL): {
   // Scripts from comment-stripped html (need the tags), before script bodies go away.
   const scripts = [...noComments.matchAll(/<script\b[^>]*>/gi)].map((m) => m[0])
   const scriptOrigins = new Set<string>()
+  const scriptSrcs: string[] = [] // full SAME-ORIGIN script URLs — the SPA's bundles
   let inlineScripts = 0
   let externalNoSri = 0
   for (const s of scripts) {
@@ -104,6 +105,7 @@ export function extractStructure(html: string, pageUrl: URL): {
       try {
         const o = new URL(src, base)
         scriptOrigins.add(o.origin)
+        if (o.origin === pageUrl.origin) scriptSrcs.push(o.toString())
         if (o.origin !== pageUrl.origin && !attr(s, 'integrity')) externalNoSri++ // SRI missing on 3rd-party
       } catch {
         /* ignore malformed src */
@@ -153,6 +155,7 @@ export function extractStructure(html: string, pageUrl: URL): {
     lang,
     headings,
     scriptOrigins: [...scriptOrigins],
+    scriptSrcs: scriptSrcs.slice(0, 12),
     inlineScripts,
     externalScriptsNoSri: externalNoSri,
     imgCount,

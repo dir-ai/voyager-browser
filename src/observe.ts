@@ -130,6 +130,20 @@ export async function observe(input: string, opts: ObserveOptions = {}): Promise
   brief.renderConfidence = render === 'static' ? 'strong' : 'moderate'
   if (render !== 'static') findings.push({ severity: 'info', kind: 'client-rendered', detail: `page appears ${render} (JavaScript renders most content) — a static fetch sees only ${structure.visibleTextLength} chars of text; structure/forms below may be incomplete`, at: url.origin, suggestedFix: 'observe with a rendering pass for full coverage; treat the static view as partial', confidence: 'moderate' })
 
+  // ── Mine SAME-ORIGIN JS bundles for the API surface the empty page hides (Kimi
+  // #7). An SPA's real endpoints (/api/admin/backup, …) live in bundle.js, not the
+  // HTML. Same-origin only + pinned to the page's vetted IP (SSRF-safe), bounded.
+  const endpoints = new Set<string>()
+  for (const srcUrl of structure.scriptSrcs.slice(0, 6)) {
+    try {
+      const js = await safeGet(srcUrl, { pinnedIp: resolvedIp!, timeoutMs, maxBytes: 1_500_000 })
+      if (js.status >= 200 && js.status < 300) extractEndpoints(js.body, endpoints)
+    } catch {
+      /* a bundle that won't fetch is skipped — the rest still run */
+    }
+  }
+  if (endpoints.size) findings.push(f('medium', 'exposed-endpoint', `${endpoints.size} API endpoint(s) referenced in the JS bundles (the SPA's real surface, invisible in the static HTML): ${[...endpoints].slice(0, 15).map((e) => clean(e, 80)).join(', ')}`, url.origin, 'confirm every endpoint enforces authorization server-side — a path in a bundle is not a secret; treat each as reachable', 'moderate'))
+
   // ── Security posture from headers + content ──────────────────────────────
   const cspStr = h('content-security-policy')
   const cspWeaknesses = cspStr ? gradeCsp(cspStr) : []
@@ -229,6 +243,13 @@ export async function observe(input: string, opts: ObserveOptions = {}): Promise
   brief.suggestedNextProbes = probes
 
   return brief
+}
+
+/** Pull API endpoint paths out of a JS bundle: absolute-path string literals like
+ *  "/api/…" and fetch/axios call targets. Bounded; de-duplicated by the caller's Set. */
+function extractEndpoints(js: string, out: Set<string>): void {
+  for (const m of js.matchAll(/["'`](\/(?:api|v\d|graphql|rest|internal|admin|rpc)\/[A-Za-z0-9_\-/.:{}$]*)["'`]/g)) if (out.size < 60) out.add(m[1].slice(0, 120))
+  for (const m of js.matchAll(/\b(?:fetch|axios(?:\.[a-z]+)?)\s*\(\s*["'`](\/[A-Za-z0-9_\-/.:{}$]+)["'`]/g)) if (out.size < 60) out.add(m[1].slice(0, 120))
 }
 
 function f(severity: PageFinding['severity'], kind: string, detail: string, at: string, suggestedFix: string, confidence: PageFinding['confidence'] = 'strong'): PageFinding {

@@ -54,6 +54,8 @@ export interface PageStructure {
   headings: Array<{ level: number; text: Framed }>
   /** Distinct origins of <script src>. */
   scriptOrigins: string[]
+  /** Full SAME-ORIGIN script bundle URLs — fetched to mine the SPA's API endpoints. */
+  scriptSrcs: string[]
   inlineScripts: number
   /** Third-party <script src> without Subresource Integrity (supply-chain surface). */
   externalScriptsNoSri: number

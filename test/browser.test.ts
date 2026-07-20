@@ -187,3 +187,11 @@ test('extractStructure: cross-origin iframes, resource hints and srcset origins 
   assert.ok(structure.resourceHintOrigins.includes('https://track.evil.example'), 'resource hint origin captured')
   assert.ok(structure.srcsetOrigins.includes('https://img.cdn.example'), 'srcset third-party origin captured')
 })
+
+// Kimi #7: same-origin bundle URLs captured (feed the API-endpoint mining).
+test('extractStructure: captures same-origin script bundle URLs, excludes third-party', () => {
+  const html = '<html><head><script src="/static/bundle.abc.js"></script><script src="https://cdn.other.example/lib.js"></script></head><body></body></html>'
+  const { structure } = extractStructure(html, new URL('https://app.example/'))
+  assert.ok(structure.scriptSrcs.includes('https://app.example/static/bundle.abc.js'), 'same-origin bundle captured as full URL')
+  assert.ok(!structure.scriptSrcs.some((s) => /cdn\.other/.test(s)), 'third-party script excluded from bundle fetch list')
+})
