@@ -145,6 +145,10 @@ export interface ObserveOptions {
    *  internal app). Permits private ranges but STILL refuses cloud-metadata and
    *  link-local. Mirrors voyager-net's `authorized`. Default false = public only. */
   authorized?: boolean
-  /** Extra request header pairs (never used to send credentials). */
+  /** Passive discovery of well-known sensitive paths (bounded same-origin GETs to
+   *  a short fixed list — /.git/config, /.env, … — flagging only a CONFIRMED
+   *  signature, never a bare 200). Read-only. Default true; set false to skip. */
+  discoverPaths?: boolean
+  /** Progress log callback. */
   onLog?: (line: string) => void
 }

@@ -1,6 +1,6 @@
 {
   "name": "@dir-ai/voyager-browser",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "mcpName": "io.github.dir-ai/voyager-browser",
   "description": "Voyager's web-page sense: a safe, read-only observation of ONE live URL — structure, forms, links, scripts, security posture (CSP/HSTS/mixed-content) and accessibility signals. Static HTML, no JS execution, no headless browser.",
   "type": "module",

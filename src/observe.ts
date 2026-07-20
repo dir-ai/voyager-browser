@@ -3,6 +3,8 @@ import { promisify } from 'node:util'
 import { blockedIpReason, parseUrl } from './authorize.js'
 import { safeGet } from './fetch.js'
 import { extractStructure, clean } from './html.js'
+import { detectBodySignatures, bodySignatureFindings, analyzeJwts, type JwtSource } from './detect.js'
+import { discoverWellKnown } from './discover.js'
 import type { ObserveOptions, PageBrief, PageFinding, RenderMode, SecurityPosture } from './types.js'
 
 const dnsLookup = promisify(dnsLookupCb)
@@ -110,8 +112,31 @@ export async function observe(input: string, opts: ObserveOptions = {}): Promise
     return (Array.isArray(v) ? v[0] : v ?? '') as string
   }
 
+  // ── Read-only detectors that apply to ANY response (HTML or not) ───────────
+  // Body-content signatures on the page body (directory listing / stack trace /
+  // verbose framework error), plus JWT sources (headers + Set-Cookie + body;
+  // same-origin bundles are added below for HTML pages).
+  const bodySigFindings = bodySignatureFindings(detectBodySignatures(res.body), url.toString())
+  const jwtSources: JwtSource[] = []
+  for (const [k, v] of Object.entries(res.headers)) {
+    const val = Array.isArray(v) ? v.join(' ') : String(v ?? '')
+    if (val && val.includes('eyJ')) jwtSources.push({ where: `response header ${k}`, text: val })
+  }
+  for (const c of res.setCookies) if (c.includes('eyJ')) jwtSources.push({ where: 'Set-Cookie', text: c })
+  jwtSources.push({ where: 'page body', text: res.body })
+
+  // PASSIVE DISCOVERY of well-known sensitive paths (bounded same-origin GETs,
+  // pinned to the vetted IP, confirmed-signature only). Read-only. Default on.
+  const doDiscover = opts.discoverPaths !== false
+  const discoveryFindings = doDiscover ? await discoverWellKnown(url.origin, resolvedIp!, { timeoutMs, allowPrivate, onLog: log }) : []
+  if (doDiscover) notes.push('probed a fixed list of well-known sensitive paths (read-only, same-origin) — flags CONFIRMED signatures only')
+
   if (!isHtml) {
-    brief.summary = `${url.origin} — ${status}, non-HTML content (${contentType ?? 'unknown'}). Nothing to observe structurally.`
+    const jwtFindings = analyzeJwts(jwtSources, url.toString())
+    brief.findings = [...bodySigFindings, ...discoveryFindings, ...jwtFindings]
+    brief.summary =
+      `${url.origin} — ${status}, non-HTML content (${contentType ?? 'unknown'}).` +
+      (brief.findings.length ? ` ${brief.findings.length} finding(s) from read-only detectors (no structural parse).` : ' Nothing to observe structurally.')
     brief.confidence = 'moderate'
     return brief
   }
@@ -138,12 +163,19 @@ export async function observe(input: string, opts: ObserveOptions = {}): Promise
   for (const srcUrl of structure.scriptSrcs.slice(0, 6)) {
     try {
       const js = await safeGet(srcUrl, { pinnedIp: resolvedIp!, timeoutMs, maxBytes: 1_500_000, allowPrivate })
-      if (js.status >= 200 && js.status < 300) extractEndpoints(js.body, endpoints)
+      if (js.status >= 200 && js.status < 300) {
+        extractEndpoints(js.body, endpoints)
+        if (js.body.includes('eyJ')) jwtSources.push({ where: `bundle ${clean(srcUrl, 120)}`, text: js.body })
+      }
     } catch {
       /* a bundle that won't fetch is skipped — the rest still run */
     }
   }
   if (endpoints.size) findings.push(f('medium', 'exposed-endpoint', `${endpoints.size} API endpoint(s) referenced in the JS bundles (the SPA's real surface, invisible in the static HTML): ${[...endpoints].slice(0, 15).map((e) => clean(e, 80)).join(', ')}`, url.origin, 'confirm every endpoint enforces authorization server-side — a path in a bundle is not a secret; treat each as reachable', 'moderate'))
+
+  // Merge the read-only detector findings (body signatures, well-known-path
+  // discovery, and JWTs across HTML + headers + cookies + same-origin bundles).
+  findings.push(...bodySigFindings, ...discoveryFindings, ...analyzeJwts(jwtSources, url.toString()))
 
   // ── Security posture from headers + content ──────────────────────────────
   const cspStr = h('content-security-policy')

@@ -17,13 +17,14 @@ const TOOLS = [
   {
     name: 'observe_page',
     description:
-      "Read-only observation of ONE live web page: title/structure, forms (with insecure/cross-origin/sensitive flags), links (external + unsafe target=_blank), script origins, security posture (HTTPS/HSTS/CSP/mixed-content/cookies) and accessibility signals (lang, img alt coverage, heading order) → findings with DESCRIBED (never applied) fixes. Parses STATIC HTML only — no JavaScript execution, no headless browser, so it cannot see client-side-rendered runtime state. All page text is returned FRAMED as untrusted. SSRF-gated: refuses non-http(s) URLs and, by default, anything resolving to private/loopback/cloud-metadata addresses — pass authorized:true to observe your OWN private/loopback/intranet target (cloud-metadata + link-local stay blocked). isError:true means the page could not be observed, not that it is clean.",
+      "Read-only observation of ONE live web page: title/structure, forms (with insecure/cross-origin/sensitive flags), links (external + unsafe target=_blank), script origins, security posture (HTTPS/HSTS/CSP/mixed-content/cookies) and accessibility signals (lang, img alt coverage, heading order) → findings with DESCRIBED (never applied) fixes. ALSO runs read-only leak detectors: body-content signatures (directory listings, language-specific stack traces, verbose framework debug/error pages), exposed JWTs decoded from the HTML/headers/cookies/same-origin bundles (flags alg:none, expired, and no-exp — NO signature verification, NO secret cracking), and PASSIVE DISCOVERY of a short fixed list of well-known sensitive paths (/.git/config, /.env, /.svn/entries, /.DS_Store, /config.json, /wp-config.php~, /backup/, /uploads/) via bounded same-origin GETs that flag only a CONFIRMED signature (never a bare 200). Parses STATIC HTML only — no JavaScript execution, no headless browser, so it cannot see client-side-rendered runtime state. All target-derived text is returned FRAMED as untrusted. SSRF-gated: refuses non-http(s) URLs and, by default, anything resolving to private/loopback/cloud-metadata addresses — pass authorized:true to observe your OWN private/loopback/intranet target (cloud-metadata + link-local stay blocked). NEVER mutates, submits a form, or exploits — every request is a GET. isError:true means the page could not be observed, not that it is clean.",
     inputSchema: {
       type: 'object',
       additionalProperties: false,
       properties: {
         url: { type: 'string', minLength: 1, maxLength: 2048, description: 'A single http(s) URL to observe.' },
         authorized: { type: 'boolean', description: 'Set true to observe your OWN private/loopback/intranet target (staging, an internal app). Permits private ranges but STILL refuses cloud-metadata + link-local. Default false = public URLs only.' },
+        discoverPaths: { type: 'boolean', description: 'Passive discovery of well-known sensitive paths via bounded same-origin read-only GETs (flags CONFIRMED signatures only). Default true; set false to skip.' },
         timeoutMs: { type: 'integer', minimum: 1000, maximum: 30000 },
         maxBytes: { type: 'integer', minimum: 10000, maximum: 10000000 },
       },
@@ -47,7 +48,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const timeoutMs = typeof a.timeoutMs === 'number' && Number.isInteger(a.timeoutMs) ? a.timeoutMs : undefined
       const maxBytes = typeof a.maxBytes === 'number' && Number.isInteger(a.maxBytes) ? a.maxBytes : undefined
       const authorized = a.authorized === true
-      const brief = await observe(url, { timeoutMs, maxBytes, authorized })
+      const discoverPaths = a.discoverPaths === false ? false : undefined
+      const brief = await observe(url, { timeoutMs, maxBytes, authorized, discoverPaths })
       return ok(brief, Boolean(brief.error))
     }
     return err(`Unknown tool: ${name}`)

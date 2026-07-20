@@ -4,6 +4,7 @@ import http from 'node:http'
 import net from 'node:net'
 import { parseUrl, blockedIpReason } from '../dist/authorize.js'
 import { frame, extractStructure } from '../dist/html.js'
+import { detectBodySignatures, analyzeJwts } from '../dist/detect.js'
 import { observe } from '../dist/observe.js'
 
 test('parseUrl: accepts a bare host as https, keeps a full URL', () => {
@@ -237,5 +238,131 @@ test('observe: a REAL loopback app is refused by default, observed WITH authoriz
     assert.equal(ok.error, undefined, 'authorized: the loopback app is observed, no error')
     assert.equal(ok.status, 200)
     assert.ok(ok.forms.length >= 1, 'authorized: parsed the login form on the internal app')
+  } finally { srv.close() }
+})
+
+// ── Kimi web-audit round: read-only leak detectors ──────────────────────────
+
+// (A) Body-content signatures — unit-level, on strings (no network).
+test('detectBodySignatures: Apache directory listing is detected', () => {
+  const body = '<html><head><title>Index of /backup</title></head><body><h1>Index of /backup</h1><a href="../">Parent Directory</a><a href="db.sql">db.sql</a></body></html>'
+  const sigs = detectBodySignatures(body)
+  assert.ok(sigs.some((s) => s.kind === 'directory-listing'), 'directory listing flagged')
+})
+
+test('detectBodySignatures: language stack traces + verbose framework errors are detected', () => {
+  assert.ok(detectBodySignatures('Traceback (most recent call last):\n  File "app.py", line 4').some((s) => s.kind === 'stack-trace'), 'python traceback')
+  assert.ok(detectBodySignatures('You have an error in your SQL syntax; check the manual').some((s) => s.kind === 'stack-trace'), 'mysql syntax error')
+  assert.ok(detectBodySignatures('<title>ORA-01722: invalid number</title>').some((s) => s.kind === 'stack-trace'), 'oracle ORA-')
+  assert.ok(detectBodySignatures("<h1>Server Error in '/' Application.</h1>").some((s) => s.kind === 'verbose-error'), 'asp.net YSOD')
+  assert.ok(detectBodySignatures('<title>Werkzeug Debugger</title>The debugger caught an exception').some((s) => s.kind === 'verbose-error'), 'werkzeug debugger')
+})
+
+test('detectBodySignatures: a clean page yields NO body-signature false positives', () => {
+  const clean = '<html lang="en"><head><title>Home</title></head><body><h1>Welcome</h1><p>Index of products below. No errors here.</p></body></html>'
+  assert.equal(detectBodySignatures(clean).length, 0, 'clean page → no signatures')
+})
+
+// (B) JWT analyzer — unit-level (decode-only, no verification).
+const b64u = (o: unknown): string => Buffer.from(JSON.stringify(o)).toString('base64url')
+const mkJwt = (header: unknown, payload: unknown, sig = ''): string => `${b64u(header)}.${b64u(payload)}.${sig}`
+
+test('analyzeJwts: flags alg:none (critical), expired (medium) and no-exp (low); frames claims', () => {
+  const none = mkJwt({ alg: 'none', typ: 'JWT' }, { sub: 'admin', iss: 'acme' })
+  const expired = mkJwt({ alg: 'HS256', typ: 'JWT' }, { sub: 'u1', exp: 1000000000 }, 'sig') // 2001 → expired
+  const noexp = mkJwt({ alg: 'HS256', typ: 'JWT' }, { sub: 'u2' }, 'sig')
+  const findings = analyzeJwts([
+    { where: 'Set-Cookie', text: `session=${none}; Path=/` },
+    { where: 'page body', text: `<script>var t="${expired}"; var t2="${noexp}";</script>` },
+  ], 'https://app.test/')
+  assert.ok(findings.some((f) => f.kind === 'jwt-alg-none' && f.severity === 'critical'), 'alg:none critical')
+  assert.ok(findings.some((f) => f.kind === 'jwt-expired' && f.severity === 'medium'), 'expired medium')
+  assert.ok(findings.some((f) => f.kind === 'jwt-no-exp' && f.severity === 'low'), 'no-exp low')
+})
+
+test('analyzeJwts: a base64-looking non-JWT and clean tokens produce nothing', () => {
+  assert.equal(analyzeJwts([{ where: 'page body', text: 'eyJhbGc.notavalidjwt.xx and some eyJ text' }], 'https://x.test/').length, 0)
+  const valid = mkJwt({ alg: 'RS256', typ: 'JWT' }, { sub: 'u', exp: 4102444800 }, 'sig') // exp in 2100
+  assert.equal(analyzeJwts([{ where: 'page body', text: valid }], 'https://x.test/').length, 0, 'a signed, unexpired, exp-bearing JWT is not flagged')
+})
+
+// (C) End-to-end on REAL loopback servers.
+test('observe (discovery): a REAL server exposing /.git/config is flagged; a clean app is not', async () => {
+  const gitBody = '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n[remote "origin"]\n\turl = git@github.com:acme/secret.git\n'
+  const leaky = http.createServer((req, res) => {
+    if (req.url === '/.git/config') { res.writeHead(200, { 'content-type': 'text/plain' }); res.end(gitBody); return }
+    if (req.url === '/') { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<html><head><title>App</title></head><body>hi</body></html>'); return }
+    res.writeHead(404); res.end('nope')
+  })
+  leaky.on('error', () => {})
+  const clean = http.createServer((req, res) => {
+    if (req.url === '/') { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<html><head><title>App</title></head><body>hi</body></html>'); return }
+    res.writeHead(404); res.end('nope')
+  })
+  clean.on('error', () => {})
+  const [lp, cp] = [await bind(leaky), await bind(clean)]
+  try {
+    const hit = await observe(`http://127.0.0.1:${lp}/`, { authorized: true })
+    assert.equal(hit.error, undefined)
+    const git = hit.findings.find((f) => f.kind === 'exposed-sensitive-path' && /\.git\/config/.test(f.detail))
+    assert.ok(git, 'exposed .git/config flagged')
+    assert.equal(git!.severity, 'high')
+
+    const none = await observe(`http://127.0.0.1:${cp}/`, { authorized: true })
+    assert.equal(none.findings.some((f) => f.kind === 'exposed-sensitive-path'), false, 'clean app → no exposed-sensitive-path (no bare-200 false positive)')
+  } finally { leaky.close(); clean.close() }
+})
+
+test('observe (body detectors): a REAL server returning a directory listing / stack trace is flagged', async () => {
+  const listing = http.createServer((req, res) => {
+    if (req.url === '/') { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<html><head><title>Index of /</title></head><body><h1>Index of /</h1><a href="../">Parent Directory</a><a href="secret.env">secret.env</a></body></html>'); return }
+    res.writeHead(404); res.end('nope')
+  })
+  listing.on('error', () => {})
+  const trace = http.createServer((req, res) => {
+    if (req.url === '/') { res.writeHead(500, { 'content-type': 'text/html' }); res.end('<html><body><pre>Traceback (most recent call last):\n  File "/srv/app/views.py", line 42, in index\n    1/0\nZeroDivisionError: division by zero</pre></body></html>'); return }
+    res.writeHead(404); res.end('nope')
+  })
+  trace.on('error', () => {})
+  const [lp, tp] = [await bind(listing), await bind(trace)]
+  try {
+    const l = await observe(`http://127.0.0.1:${lp}/`, { authorized: true })
+    assert.ok(l.findings.some((f) => f.kind === 'directory-listing'), 'directory listing flagged on the live page')
+
+    const t = await observe(`http://127.0.0.1:${tp}/`, { authorized: true })
+    assert.ok(t.findings.some((f) => f.kind === 'stack-trace-disclosure'), 'stack trace flagged on the live page')
+  } finally { listing.close(); trace.close() }
+})
+
+test('observe (JWT): a REAL server setting an alg:none JWT cookie is flagged critical', async () => {
+  const noneJwt = mkJwt({ alg: 'none', typ: 'JWT' }, { sub: 'admin', iss: 'acme', role: 'root' })
+  const srv = http.createServer((req, res) => {
+    if (req.url === '/') { res.writeHead(200, { 'content-type': 'text/html', 'set-cookie': `session=${noneJwt}; Path=/` }); res.end('<html><head><title>App</title></head><body>ok</body></html>'); return }
+    res.writeHead(404); res.end('nope')
+  })
+  srv.on('error', () => {})
+  const port = await bind(srv)
+  try {
+    const brief = await observe(`http://127.0.0.1:${port}/`, { authorized: true })
+    const jwt = brief.findings.find((f) => f.kind === 'jwt-alg-none')
+    assert.ok(jwt, 'alg:none JWT in Set-Cookie flagged')
+    assert.equal(jwt!.severity, 'critical')
+    assert.match(jwt!.detail, /cookie/i)
+  } finally { srv.close() }
+})
+
+test('observe (--no-discovery): discoverPaths:false skips the well-known probes', async () => {
+  let gitProbed = false
+  const srv = http.createServer((req, res) => {
+    if (req.url === '/.git/config') { gitProbed = true; res.writeHead(200, { 'content-type': 'text/plain' }); res.end('[core]\n\trepositoryformatversion = 0\n'); return }
+    if (req.url === '/') { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<html><head><title>App</title></head><body>hi</body></html>'); return }
+    res.writeHead(404); res.end('nope')
+  })
+  srv.on('error', () => {})
+  const port = await bind(srv)
+  try {
+    const brief = await observe(`http://127.0.0.1:${port}/`, { authorized: true, discoverPaths: false })
+    assert.equal(brief.findings.some((f) => f.kind === 'exposed-sensitive-path'), false, 'no discovery findings')
+    assert.equal(gitProbed, false, 'the well-known path was NOT requested when discovery is off')
   } finally { srv.close() }
 })
