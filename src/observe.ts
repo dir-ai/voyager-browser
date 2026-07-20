@@ -3,8 +3,9 @@ import { promisify } from 'node:util'
 import { blockedIpReason, parseUrl } from './authorize.js'
 import { safeGet } from './fetch.js'
 import { extractStructure, clean } from './html.js'
-import { detectBodySignatures, bodySignatureFindings, analyzeJwts, type JwtSource } from './detect.js'
+import { detectBodySignatures, bodySignatureFindings, analyzeJwts, scanSecrets, secretFindings, type JwtSource } from './detect.js'
 import { discoverWellKnown } from './discover.js'
+import { probeGraphqlIntrospection } from './graphql.js'
 import type { ObserveOptions, PageBrief, PageFinding, RenderMode, SecurityPosture } from './types.js'
 
 const dnsLookup = promisify(dnsLookupCb)
@@ -165,6 +166,9 @@ export async function observe(input: string, opts: ObserveOptions = {}): Promise
       const js = await safeGet(srcUrl, { pinnedIp: resolvedIp!, timeoutMs, maxBytes: 1_500_000, allowPrivate })
       if (js.status >= 200 && js.status < 300) {
         extractEndpoints(js.body, endpoints)
+        // Kimi: a secret shipped in the bundle is downloadable → compromised. Scan the
+        // body for hardcoded provider keys + high-entropy assignments (REDACTED evidence).
+        for (const sf of secretFindings(scanSecrets(js.body), srcUrl)) findings.push(sf)
         if (js.body.includes('eyJ')) jwtSources.push({ where: `bundle ${clean(srcUrl, 120)}`, text: js.body })
       }
     } catch {
@@ -172,6 +176,26 @@ export async function observe(input: string, opts: ObserveOptions = {}): Promise
     }
   }
   if (endpoints.size) findings.push(f('medium', 'exposed-endpoint', `${endpoints.size} API endpoint(s) referenced in the JS bundles (the SPA's real surface, invisible in the static HTML): ${[...endpoints].slice(0, 15).map((e) => clean(e, 80)).join(', ')}`, url.origin, 'confirm every endpoint enforces authorization server-side — a path in a bundle is not a secret; treat each as reachable', 'moderate'))
+
+  // ── GraphQL introspection (authorized, READ-ONLY POST) ────────────────────
+  // Candidate endpoints: the conventional paths + any discovered endpoint whose
+  // path looks like GraphQL. All same-origin (endpoints are absolute PATHS resolved
+  // against this origin) so the page's vetted IP pins them SSRF-safe.
+  const gqlCandidates = new Set<string>()
+  for (const p of ['/graphql', '/api/graphql']) {
+    try { gqlCandidates.add(new URL(p, url.origin).toString()) } catch { /* ignore */ }
+  }
+  for (const e of endpoints) if (/graphql/i.test(e)) { try { gqlCandidates.add(new URL(e, url.origin).toString()) } catch { /* ignore */ } }
+  let graphqlSuggested: string | null = null
+  if (gqlCandidates.size) {
+    if (allowPrivate) {
+      // authorized — send ONE read-only introspection query per candidate, pinned.
+      findings.push(...(await probeGraphqlIntrospection([...gqlCandidates], resolvedIp!, { timeoutMs, allowPrivate, onLog: log })))
+    } else {
+      // not authorized — do NOT send the POST; surface it as a suggested probe.
+      graphqlSuggested = `a GraphQL endpoint appears reachable (${clean([...gqlCandidates][0], 120)}) — re-run with --authorized to send a READ-ONLY introspection query`
+    }
+  }
 
   // Merge the read-only detector findings (body signatures, well-known-path
   // discovery, and JWTs across HTML + headers + cookies + same-origin bundles).
@@ -189,7 +213,8 @@ export async function observe(input: string, opts: ObserveOptions = {}): Promise
 
   const mixedContent = https ? collectMixedContent(html, url) : []
   const thirdPartyScripts = structure.scriptOrigins.filter((o) => o !== url.origin)
-  const insecureCookies = evalCookies(res.setCookies)
+  const cookieIssues = evalCookies(res.setCookies)
+  const insecureCookies = cookieIssues.filter((c) => c.noSecureHttpOnly).map((c) => c.name)
 
   const security: SecurityPosture = {
     https,
@@ -221,7 +246,16 @@ export async function observe(input: string, opts: ObserveOptions = {}): Promise
   if (!security.permissionsPolicy) findings.push(f('info', 'missing-permissions-policy', 'no Permissions-Policy', url.origin, 'add a Permissions-Policy to disable unused powerful features (camera, geolocation…)', 'moderate'))
   if (security.versionLeak) findings.push(f('low', 'version-leak', `server version disclosed: ${security.versionLeak}`, url.origin, 'remove version details from Server / X-Powered-By headers', 'moderate'))
   if (mixedContent.length) findings.push(f('high', 'mixed-content', `${mixedContent.length} insecure http:// sub-resource(s) on an HTTPS page`, mixedContent[0], 'load all sub-resources over HTTPS'))
-  for (const c of insecureCookies.slice(0, 5)) findings.push(f('medium', 'weak-cookie', `cookie "${c}" missing Secure and/or HttpOnly`, url.origin, 'set Secure + HttpOnly (and SameSite) on cookies'))
+  for (const c of cookieIssues.filter((x) => x.noSecureHttpOnly).slice(0, 5)) findings.push(f('medium', 'weak-cookie', `cookie "${clean(c.name, 80)}" missing Secure and/or HttpOnly`, url.origin, 'set Secure + HttpOnly (and SameSite) on cookies'))
+  // Kimi: a cookie with no SameSite (or SameSite=None) is sendable on cross-site
+  // requests → CSRF-able even when Secure+HttpOnly are present.
+  for (const c of cookieIssues.filter((x) => x.sameSite).slice(0, 5)) findings.push(f('medium', 'cookie-samesite', `cookie "${clean(c.name, 80)}" ${c.sameSite === 'none' ? 'has SameSite=None' : 'is missing SameSite'} — sendable cross-site (CSRF)`, url.origin, 'set SameSite=Lax (or Strict) on session/auth cookies; only use SameSite=None (with Secure) for cookies that MUST be cross-site, and pair with anti-CSRF tokens'))
+  // Kimi: CORS posture on the response. `*` lets any origin read responses; a
+  // reflected/echoed specific origin WITH credentials:true exposes authenticated data.
+  const acao = h('access-control-allow-origin').trim()
+  const acaCreds = h('access-control-allow-credentials').trim().toLowerCase() === 'true'
+  if (acao === '*') findings.push(f('medium', 'cors-wildcard', 'Access-Control-Allow-Origin: * — any origin may read responses from this endpoint', url.origin, 'restrict CORS to an explicit allow-list of trusted origins; never expose authenticated data with ACAO: *'))
+  else if (acao && acaCreds) findings.push(f('high', 'cors-credentials', `Access-Control-Allow-Origin reflects a specific origin ("${clean(acao, 120)}") WITH Access-Control-Allow-Credentials: true — authenticated responses are readable cross-origin`, url.origin, 'never combine a reflected/echoed ACAO with credentials:true; pin ACAO to a fixed trusted origin (or drop credentials) — this is the dangerous CORS combo'))
   if (structure.externalScriptsNoSri > 0) findings.push(f('low', 'missing-sri', `${structure.externalScriptsNoSri} third-party <script> without Subresource Integrity`, url.origin, 'add integrity + crossorigin to third-party scripts', 'moderate'))
   for (const fr of structure.iframes.slice(0, 8)) findings.push(f(fr.sandboxed ? 'info' : 'medium', fr.sandboxed ? 'embedded-frame' : 'embedded-frame-unsandboxed', `embeds cross-origin ${fr.origin} in an iframe${fr.sandboxed ? ' (sandboxed)' : ' WITHOUT sandbox — full-privilege third-party frame'}`, fr.origin, fr.sandboxed ? 'confirm the embedded third party is intended' : "add a sandbox attribute and restrict allowed capabilities", 'moderate'))
   // Inventory the FULL embedded third-party surface (scripts + iframes + hints +
@@ -272,6 +306,7 @@ export async function observe(input: string, opts: ObserveOptions = {}): Promise
   if (thirdPartyScripts.length) probes.push(`vet the third-party script origin(s): ${thirdPartyScripts.slice(0, 3).join(', ')} (via @dir-ai/voyager-net or @dir-ai/voyager)`)
   if (forms.some((fo) => fo.sensitive)) probes.push('audit the host serving the sensitive form (via @dir-ai/voyager-net --authorized)')
   if (render !== 'static') probes.push('re-observe with a rendering pass to see the client-rendered content')
+  if (graphqlSuggested) probes.push(graphqlSuggested)
   if (structure.headings[0]?.level !== 1) probes.push('confirm the page has a single top-level <h1>')
   brief.suggestedNextProbes = probes
 
@@ -302,15 +337,28 @@ function gradeCsp(csp: string): string[] {
   return w
 }
 
+interface CookieIssue {
+  name: string
+  /** Missing Secure and/or HttpOnly. */
+  noSecureHttpOnly: boolean
+  /** SameSite posture: 'missing' (no SameSite attr) or 'none' (SameSite=None) — both
+   *  are cross-site-sendable (CSRF surface); null when SameSite=Lax/Strict. */
+  sameSite: 'missing' | 'none' | null
+}
+
 /** Evaluate EACH Set-Cookie line individually (a blob join would mask one bad
- *  cookie among several). Returns the names of cookies missing Secure/HttpOnly. */
-function evalCookies(setCookies: string[]): string[] {
-  const bad: string[] = []
+ *  cookie among several). Flags missing Secure/HttpOnly AND a cross-site-sendable
+ *  SameSite posture (missing entirely, or explicit SameSite=None). */
+function evalCookies(setCookies: string[]): CookieIssue[] {
+  const out: CookieIssue[] = []
   for (const line of setCookies) {
     const name = /^\s*([^=;\s]+)\s*=/.exec(line)?.[1] ?? '(unnamed)'
-    if (!/;\s*secure/i.test(line) || !/;\s*httponly/i.test(line)) bad.push(name)
+    const noSecureHttpOnly = !/;\s*secure/i.test(line) || !/;\s*httponly/i.test(line)
+    const ssMatch = /;\s*samesite\s*=\s*([a-z]+)/i.exec(line)
+    const sameSite: CookieIssue['sameSite'] = !ssMatch ? 'missing' : ssMatch[1].toLowerCase() === 'none' ? 'none' : null
+    if (noSecureHttpOnly || sameSite) out.push({ name, noSecureHttpOnly, sameSite })
   }
-  return bad
+  return out
 }
 
 /** Collect http:// sub-resources on an https page by comparing parsed ORIGINS

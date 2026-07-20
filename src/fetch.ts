@@ -31,6 +31,20 @@ export interface SafeGetOptions {
  * Redirects are NOT followed here (the caller re-vets each hop).
  */
 export function safeGet(urlStr: string, opts: SafeGetOptions): Promise<SafeGetResult> {
+  return safeRequest('GET', urlStr, opts)
+}
+
+/**
+ * A POST that PINS the socket to a pre-vetted IP exactly like safeGet — same SSRF
+ * gate, same single deadline, same body cap. The ONLY write voyager-browser makes:
+ * a read-only GraphQL introspection query to the owner's own endpoint, gated behind
+ * `authorized`. `body` is sent as application/json. Redirects are NOT followed.
+ */
+export function safePost(urlStr: string, opts: SafeGetOptions, body: string): Promise<SafeGetResult> {
+  return safeRequest('POST', urlStr, opts, body)
+}
+
+function safeRequest(method: 'GET' | 'POST', urlStr: string, opts: SafeGetOptions, body?: string): Promise<SafeGetResult> {
   const url = new URL(urlStr)
   const isHttps = url.protocol === 'https:'
   const mod = isHttps ? https : http
@@ -60,16 +74,25 @@ export function safeGet(urlStr: string, opts: SafeGetOptions): Promise<SafeGetRe
       fn()
     }
 
+    const headers: http.OutgoingHttpHeaders = {
+      accept: body !== undefined ? 'application/json, */*' : 'text/html,*/*',
+      'user-agent': 'voyager-browser (read-only page sense)',
+      host: url.host,
+    }
+    if (body !== undefined) {
+      headers['content-type'] = 'application/json'
+      headers['content-length'] = Buffer.byteLength(body)
+    }
     const req = mod.request(
       {
         protocol: url.protocol,
         hostname: url.hostname.replace(/^\[|\]$/g, ''),
         port: url.port || (isHttps ? 443 : 80),
         path: `${url.pathname}${url.search}`,
-        method: 'GET',
+        method,
         lookup,
         servername: isHttps ? url.hostname.replace(/^\[|\]$/g, '') : undefined,
-        headers: { accept: 'text/html,*/*', 'user-agent': 'voyager-browser (read-only page sense)', host: url.host },
+        headers,
       },
       (res) => {
         const chunks: Buffer[] = []
@@ -108,6 +131,7 @@ export function safeGet(urlStr: string, opts: SafeGetOptions): Promise<SafeGetRe
       done(() => reject(new Error(`timed out after ${opts.timeoutMs}ms`)))
     }, opts.timeoutMs)
     req.on('error', (e) => done(() => reject(e)))
+    if (body !== undefined) req.write(body)
     req.end()
   })
 }

@@ -15,14 +15,17 @@ USAGE
   voyager-browser observe <url> [--authorized] [--no-discovery] [--json]
                                 [--timeout <ms>] [--max-bytes <n>]
         Observe ONE live page: structure, forms, links, security posture
-        (CSP/HSTS/mixed-content), accessibility signals, body-content leaks
-        (directory listings, stack traces, verbose framework errors), exposed
-        JWTs (alg:none / expired / no-exp), and PASSIVE DISCOVERY of well-known
+        (CSP/HSTS/mixed-content, cookie Secure/HttpOnly/SameSite-CSRF, CORS
+        wildcard + reflected-origin+credentials), accessibility signals,
+        body-content leaks (directory listings, stack traces, verbose framework
+        errors), exposed JWTs (alg:none / expired / no-exp), HARDCODED SECRETS in
+        same-origin JS bundles (redacted), and PASSIVE DISCOVERY of well-known
         sensitive paths (/.git/config, /.env, …) → findings with DESCRIBED
         (never applied) fixes.
         --authorized    observe your OWN private/loopback/intranet target
                         (staging, an internal app); cloud-metadata + link-local
-                        stay blocked.
+                        stay blocked. Also enables the READ-ONLY GraphQL
+                        introspection probe (a POST to your own /graphql).
         --no-discovery  skip the well-known-path probes (structure only).
 
   voyager-browser mcp

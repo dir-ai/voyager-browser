@@ -9,9 +9,10 @@
 export { observe } from './observe.js'
 export { parseUrl, blockedIpReason } from './authorize.js'
 export { frame, extractStructure } from './html.js'
-export { detectBodySignatures, bodySignatureFindings, analyzeJwts } from './detect.js'
-export type { BodySignature, JwtSource } from './detect.js'
+export { detectBodySignatures, bodySignatureFindings, analyzeJwts, scanSecrets, secretFindings } from './detect.js'
+export type { BodySignature, JwtSource, SecretMatch } from './detect.js'
 export { discoverWellKnown } from './discover.js'
+export { probeGraphqlIntrospection, graphqlIntrospectionFinding, INTROSPECTION_QUERY } from './graphql.js'
 export type {
   PageBrief, PageFinding, PageForm, FormField, PageLink, PageStructure,
   SecurityPosture, RenderMode, Framed, Severity, Confidence, ObserveOptions,

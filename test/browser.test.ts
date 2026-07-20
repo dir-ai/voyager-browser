@@ -4,7 +4,8 @@ import http from 'node:http'
 import net from 'node:net'
 import { parseUrl, blockedIpReason } from '../dist/authorize.js'
 import { frame, extractStructure } from '../dist/html.js'
-import { detectBodySignatures, analyzeJwts } from '../dist/detect.js'
+import { detectBodySignatures, analyzeJwts, scanSecrets, secretFindings } from '../dist/detect.js'
+import { graphqlIntrospectionFinding } from '../dist/graphql.js'
 import { observe } from '../dist/observe.js'
 
 test('parseUrl: accepts a bare host as https, keeps a full URL', () => {
@@ -349,6 +350,169 @@ test('observe (JWT): a REAL server setting an alg:none JWT cookie is flagged cri
     assert.equal(jwt!.severity, 'critical')
     assert.match(jwt!.detail, /cookie/i)
   } finally { srv.close() }
+})
+
+// ── Kimi web-audit round 4: SameSite, CORS, GraphQL introspection, bundle secrets ──
+
+// (1) Cookie SameSite — end-to-end on real servers.
+test('observe (cookie SameSite): a REAL server setting Secure+HttpOnly+SameSite=None is flagged CSRF-able; a SameSite=Lax cookie is clean', async () => {
+  const csrfable = http.createServer((req, res) => {
+    // Secure + HttpOnly present → the OLD weak-cookie check passes clean; SameSite=None is the gap.
+    if (req.url === '/') { res.writeHead(200, { 'content-type': 'text/html', 'set-cookie': 'session=abc; Secure; HttpOnly; SameSite=None; Path=/' }); res.end('<html><head><title>App</title></head><body>ok</body></html>'); return }
+    res.writeHead(404); res.end('nope')
+  })
+  csrfable.on('error', () => {})
+  const safe = http.createServer((req, res) => {
+    if (req.url === '/') { res.writeHead(200, { 'content-type': 'text/html', 'set-cookie': 'session=abc; Secure; HttpOnly; SameSite=Lax; Path=/' }); res.end('<html><head><title>App</title></head><body>ok</body></html>'); return }
+    res.writeHead(404); res.end('nope')
+  })
+  safe.on('error', () => {})
+  const [bp, gp] = [await bind(csrfable), await bind(safe)]
+  try {
+    const bad = await observe(`http://127.0.0.1:${bp}/`, { authorized: true, discoverPaths: false })
+    const ss = bad.findings.find((f) => f.kind === 'cookie-samesite')
+    assert.ok(ss, 'SameSite=None cookie flagged')
+    assert.match(ss!.detail, /SameSite=None|cross-site/i)
+    assert.equal(bad.findings.some((f) => f.kind === 'weak-cookie'), false, 'Secure+HttpOnly present → no weak-cookie false positive')
+
+    const good = await observe(`http://127.0.0.1:${gp}/`, { authorized: true, discoverPaths: false })
+    assert.equal(good.findings.some((f) => f.kind === 'cookie-samesite'), false, 'SameSite=Lax → not flagged')
+  } finally { csrfable.close(); safe.close() }
+})
+
+// (2) CORS — end-to-end on real servers.
+test('observe (CORS): ACAO:* → cors-wildcard (medium); reflected origin + credentials:true → cors-credentials (high); clean app → neither', async () => {
+  const wildcard = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html', 'access-control-allow-origin': '*' }); res.end('<html><head><title>W</title></head><body>ok</body></html>')
+  })
+  wildcard.on('error', () => {})
+  const creds = http.createServer((req, res) => {
+    // reflect the caller's Origin (echo) AND allow credentials — the dangerous combo.
+    res.writeHead(200, { 'content-type': 'text/html', 'access-control-allow-origin': 'https://evil.example', 'access-control-allow-credentials': 'true' }); res.end('<html><head><title>C</title></head><body>ok</body></html>')
+  })
+  creds.on('error', () => {})
+  const cleanSrv = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<html><head><title>Clean</title></head><body>ok</body></html>') })
+  cleanSrv.on('error', () => {})
+  const [wp, cp, kp] = [await bind(wildcard), await bind(creds), await bind(cleanSrv)]
+  try {
+    const w = await observe(`http://127.0.0.1:${wp}/`, { authorized: true, discoverPaths: false })
+    const cw = w.findings.find((f) => f.kind === 'cors-wildcard')
+    assert.ok(cw && cw.severity === 'medium', 'ACAO:* → cors-wildcard medium')
+
+    const c = await observe(`http://127.0.0.1:${cp}/`, { authorized: true, discoverPaths: false })
+    const cc = c.findings.find((f) => f.kind === 'cors-credentials')
+    assert.ok(cc && cc.severity === 'high', 'reflected origin + credentials → cors-credentials high')
+    assert.match(cc!.detail, /evil\.example/, 'the reflected origin is framed into the finding')
+
+    const k = await observe(`http://127.0.0.1:${kp}/`, { authorized: true, discoverPaths: false })
+    assert.equal(k.findings.some((f) => f.kind === 'cors-wildcard' || f.kind === 'cors-credentials'), false, 'clean app → no CORS false positive')
+  } finally { wildcard.close(); creds.close(); cleanSrv.close() }
+})
+
+// (3) GraphQL introspection — unit + end-to-end.
+test('graphqlIntrospectionFinding: a schema with a sensitive field is HIGH; a plain schema is MEDIUM; a non-schema body is null', () => {
+  const withSecret = JSON.stringify({ data: { __schema: { queryType: { name: 'Query' }, types: [{ name: 'User', fields: [{ name: 'id' }, { name: 'passwordHash' }] }, { name: '__Directive', fields: [] }] } } })
+  const hi = graphqlIntrospectionFinding('https://x.test/graphql', withSecret)
+  assert.ok(hi && hi.kind === 'graphql-introspection-enabled' && hi.severity === 'high', 'sensitive field → high')
+  assert.match(hi!.detail, /passwordHash/, 'the sensitive field name is surfaced')
+  assert.ok(!/__Directive/.test(hi!.detail), 'GraphQL internals (__*) are excluded')
+
+  const plain = JSON.stringify({ data: { __schema: { queryType: { name: 'Query' }, types: [{ name: 'Product', fields: [{ name: 'title' }] }] } } })
+  assert.equal(graphqlIntrospectionFinding('https://x.test/graphql', plain)!.severity, 'medium', 'no sensitive names → medium')
+
+  assert.equal(graphqlIntrospectionFinding('https://x.test/graphql', '{"errors":[{"message":"introspection disabled"}]}'), null, 'no schema → null')
+  assert.equal(graphqlIntrospectionFinding('https://x.test/graphql', 'not json'), null, 'non-JSON → null')
+})
+
+test('observe (GraphQL): authorized sends ONE read-only introspection POST and flags it; UNauthorized never POSTs (suggests it instead)', async () => {
+  let introspectionPosts = 0
+  const gql = http.createServer((req, res) => {
+    if (req.url === '/graphql' && req.method === 'POST') {
+      introspectionPosts++
+      let body = ''
+      req.on('data', (c) => { body += c })
+      req.on('end', () => {
+        // Confirm it is the read-only introspection query (a QUERY, never a mutation).
+        assert.match(body, /__schema/, 'the probe is an introspection query')
+        assert.ok(!/mutation/i.test(body), 'the probe contains no mutation')
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ data: { __schema: { queryType: { name: 'Query' }, types: [{ name: 'User', fields: [{ name: 'id' }, { name: 'ssn' }] }] } } }))
+      })
+      return
+    }
+    if (req.url === '/') { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<html><head><title>GQL</title></head><body>ok</body></html>'); return }
+    res.writeHead(404); res.end('nope')
+  })
+  gql.on('error', () => {})
+  const port = await bind(gql)
+  try {
+    const authed = await observe(`http://127.0.0.1:${port}/`, { authorized: true, discoverPaths: false })
+    const gi = authed.findings.find((f) => f.kind === 'graphql-introspection-enabled')
+    assert.ok(gi, 'authorized: introspection flagged')
+    assert.equal(gi!.severity, 'high', 'a sensitive field (ssn) raises it to high')
+    assert.ok(introspectionPosts >= 1, 'authorized: the introspection POST was sent')
+
+    // UNauthorized against the SAME endpoint on loopback is refused at the SSRF gate;
+    // prove the no-POST contract on a public-shaped path instead: authorized:false must
+    // not emit the POST. (Loopback is refused before any request, so posts stay at 1.)
+    const before = introspectionPosts
+    const unauth = await observe(`http://127.0.0.1:${port}/`)
+    assert.ok(unauth.error, 'unauthorized loopback is SSRF-refused (no requests sent at all)')
+    assert.equal(introspectionPosts, before, 'no introspection POST when unauthorized')
+  } finally { gql.close() }
+})
+
+// (4) Secrets in JS bundles — unit + end-to-end.
+test('scanSecrets: matches provider key shapes + generic assignment, REDACTS the value, no false positive on clean JS', () => {
+  const bundle = [
+    'const stripe = "sk-live-ABCDEFGHIJKLMNOPQRSTUVWX";',
+    'const aws = "AKIAIOSFODNN7EXAMPLE";',
+    'const gh = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";',
+    'const cfg = { api_key: "aVeryLongApiKeyValue1234567890" };',
+  ].join('\n')
+  const matches = scanSecrets(bundle)
+  const labels = matches.map((m) => m.label).join(' | ')
+  assert.match(labels, /Stripe live secret/i)
+  assert.match(labels, /AWS access key/i)
+  assert.match(labels, /GitHub personal access token/i)
+  assert.match(labels, /credential assignment/i)
+  for (const m of matches) {
+    assert.match(m.redacted, /…\(len \d+\)/, 'value is redacted to prefix + length')
+    assert.ok(!/ABCDEFGHIJKLMNOPQRSTUVWX/.test(m.redacted), 'the full Stripe secret never appears')
+    assert.ok(!/aVeryLongApiKeyValue1234567890/.test(m.redacted), 'the full generic secret never appears')
+  }
+  const findings = secretFindings(matches, 'https://app.test/bundle.js')
+  assert.ok(findings.every((f) => f.severity === 'critical' && f.kind === 'exposed-secret'))
+
+  assert.equal(scanSecrets('const x = 1; function add(a,b){ return a+b } // no secrets here').length, 0, 'clean JS → no false positive')
+})
+
+test('observe (bundle secrets): a REAL server whose same-origin bundle contains sk-live-… is flagged critical (REDACTED)', async () => {
+  const fakeKey = 'sk-live-51ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+  const srv = http.createServer((req, res) => {
+    if (req.url === '/') { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<html><head><title>SPA</title><script src="/app.js"></script></head><body><div id="root"></div></body></html>'); return }
+    if (req.url === '/app.js') { res.writeHead(200, { 'content-type': 'application/javascript' }); res.end(`const STRIPE="${fakeKey}"; console.log("hi");`); return }
+    res.writeHead(404); res.end('nope')
+  })
+  srv.on('error', () => {})
+  const cleanSrv = http.createServer((req, res) => {
+    if (req.url === '/') { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<html><head><title>SPA</title><script src="/app.js"></script></head><body><div id="root"></div></body></html>'); return }
+    if (req.url === '/app.js') { res.writeHead(200, { 'content-type': 'application/javascript' }); res.end('const version="1.2.3"; console.log("hi");'); return }
+    res.writeHead(404); res.end('nope')
+  })
+  cleanSrv.on('error', () => {})
+  const [sp, cp] = [await bind(srv), await bind(cleanSrv)]
+  try {
+    const hit = await observe(`http://127.0.0.1:${sp}/`, { authorized: true, discoverPaths: false })
+    const sec = hit.findings.find((f) => f.kind === 'exposed-secret')
+    assert.ok(sec, 'hardcoded sk-live- key in the bundle flagged')
+    assert.equal(sec!.severity, 'critical')
+    assert.match(sec!.at ?? '', /app\.js/, 'the bundle URL is reported')
+    assert.ok(!sec!.detail.includes(fakeKey), 'the full secret is NEVER in the finding (redacted)')
+
+    const none = await observe(`http://127.0.0.1:${cp}/`, { authorized: true, discoverPaths: false })
+    assert.equal(none.findings.some((f) => f.kind === 'exposed-secret'), false, 'clean bundle → no exposed-secret false positive')
+  } finally { srv.close(); cleanSrv.close() }
 })
 
 test('observe (--no-discovery): discoverPaths:false skips the well-known probes', async () => {

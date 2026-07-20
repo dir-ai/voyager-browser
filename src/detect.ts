@@ -170,3 +170,64 @@ function claimSummary(payload: Record<string, unknown>): string {
 function f(severity: PageFinding['severity'], kind: string, detail: string, at: string, suggestedFix: string): PageFinding {
   return { severity, kind, detail, at, suggestedFix, confidence: 'strong' }
 }
+
+// ── Hardcoded-secret scanner for same-origin JS bundles (Kimi web-audit) ─────
+// A secret shipped inside a client bundle is downloadable by anyone → compromised.
+// We match HIGH-SIGNAL provider key shapes plus one generic high-entropy assignment,
+// and report ONLY a REDACTED fingerprint (short prefix + length) — never the value.
+export interface SecretMatch {
+  label: string
+  /** REDACTED fingerprint: a short prefix + the total length. The full secret is
+   *  NEVER stored in a finding. */
+  redacted: string
+}
+
+/** Provider key shapes + a generic assignment. `group` picks the captured secret
+ *  when the whole regex is broader than the secret itself. `prefix` = chars shown. */
+const SECRET_PATTERNS: Array<{ re: RegExp; label: string; prefix: number; group?: number }> = [
+  { re: /sk-live-[A-Za-z0-9]{16,}/g, label: 'Stripe live secret key (sk-live-…)', prefix: 8 },
+  { re: /sk-[A-Za-z0-9]{20,}/g, label: 'secret key (sk-…, Stripe/OpenAI-style)', prefix: 3 },
+  { re: /AKIA[0-9A-Z]{16}/g, label: 'AWS access key id (AKIA…)', prefix: 4 },
+  { re: /github_pat_[A-Za-z0-9_]{20,}/g, label: 'GitHub fine-grained PAT (github_pat_…)', prefix: 11 },
+  { re: /ghp_[A-Za-z0-9]{20,}/g, label: 'GitHub personal access token (ghp_…)', prefix: 4 },
+  { re: /xox[baprs]-[A-Za-z0-9-]{10,}/g, label: 'Slack token (xox…)', prefix: 5 },
+  { re: /AIza[0-9A-Za-z_-]{35}/g, label: 'Google API key (AIza…)', prefix: 4 },
+  { re: /-----BEGIN (?:RSA |EC )?PRIVATE KEY-----/g, label: 'PEM private key block', prefix: 16 },
+  { re: /(?:api[_-]?key|secret|token|password)\s*[:=]\s*["']([A-Za-z0-9_-]{16,})["']/gi, label: 'hardcoded high-entropy credential assignment', prefix: 4, group: 1 },
+]
+
+function redactSecret(raw: string, prefix: number): string {
+  return `${raw.slice(0, prefix)}…(len ${raw.length})`
+}
+
+/** Scan a bundle body for hardcoded secrets. De-duplicated by the raw token (so a
+ *  provider-shape match and the generic assignment don't double-report the same
+ *  value); the raw token stays local — only the redacted fingerprint escapes. */
+export function scanSecrets(text: string): SecretMatch[] {
+  if (!text) return []
+  const out: SecretMatch[] = []
+  const seen = new Set<string>()
+  for (const { re, label, prefix, group } of SECRET_PATTERNS) {
+    for (const m of text.matchAll(re)) {
+      const raw = (group ? m[group] : m[0]) ?? ''
+      if (!raw || seen.has(raw)) continue
+      seen.add(raw)
+      out.push({ label, redacted: redactSecret(raw, prefix) })
+      if (out.length >= 25) return out
+    }
+  }
+  return out
+}
+
+/** Turn secret matches into critical findings. Both the label and the redacted
+ *  fingerprint are cleaned before they enter a finding. */
+export function secretFindings(matches: SecretMatch[], bundleUrl: string): PageFinding[] {
+  return matches.map((s) => ({
+    severity: 'critical' as const,
+    kind: 'exposed-secret',
+    detail: `a hardcoded secret is shipped in a same-origin JS bundle: ${clean(s.label, 80)} [${clean(s.redacted, 60)}] — anyone who downloads the bundle has it`,
+    at: clean(bundleUrl, 200),
+    suggestedFix: 'remove the secret from client-side code and ROTATE it immediately; keep secrets server-side / in a secret store — a key shipped in a bundle must be treated as compromised',
+    confidence: 'strong' as const,
+  }))
+}
