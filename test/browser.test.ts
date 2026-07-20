@@ -1,5 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import http from 'node:http'
+import net from 'node:net'
 import { parseUrl, blockedIpReason } from '../dist/authorize.js'
 import { frame, extractStructure } from '../dist/html.js'
 import { observe } from '../dist/observe.js'
@@ -194,4 +196,46 @@ test('extractStructure: captures same-origin script bundle URLs, excludes third-
   const { structure } = extractStructure(html, new URL('https://app.example/'))
   assert.ok(structure.scriptSrcs.includes('https://app.example/static/bundle.abc.js'), 'same-origin bundle captured as full URL')
   assert.ok(!structure.scriptSrcs.some((s) => /cdn\.other/.test(s)), 'third-party script excluded from bundle fetch list')
+})
+
+// ── Kimi web-audit P0: browser could not even POINT at your own staging/intranet ──
+// The SSRF gate blocked ALL loopback/private with no way in. `authorized` opens the
+// operator's OWN private space while STILL refusing cloud-metadata + link-local.
+test('authorized gate: blockedIpReason permits private/loopback ONLY with allowPrivate', () => {
+  // default (public-only) — every internal range refused
+  assert.ok(blockedIpReason('10.0.0.5'), 'private blocked by default')
+  assert.ok(blockedIpReason('127.0.0.1'), 'loopback blocked by default')
+  // allowPrivate — the operator's own space is reachable
+  assert.equal(blockedIpReason('10.0.0.5', true), null, 'private allowed when authorized')
+  assert.equal(blockedIpReason('127.0.0.1', true), null, 'loopback allowed when authorized')
+  assert.equal(blockedIpReason('192.168.1.10', true), null, 'RFC1918 allowed when authorized')
+  // public is always fine
+  assert.equal(blockedIpReason('8.8.8.8'), null, 'public unicast never blocked')
+  // the dangerous SSRF surfaces stay blocked EVEN with authorized
+  assert.ok(blockedIpReason('169.254.169.254', true), 'cloud-metadata STILL blocked when authorized')
+  assert.ok(blockedIpReason('169.254.1.1', true), 'link-local STILL blocked when authorized')
+})
+
+test('authorized gate: parseUrl gates a loopback literal by default, opens it with allowPrivate', () => {
+  assert.equal(parseUrl('http://127.0.0.1:8088').ok, false, 'loopback refused by default')
+  const ok = parseUrl('http://127.0.0.1:8088', { allowPrivate: true })
+  assert.equal(ok.ok, true, 'loopback accepted when authorized')
+  assert.equal(ok.scope, 'loopback')
+})
+
+const bind = (srv: http.Server): Promise<number> => new Promise((r) => srv.listen(0, '127.0.0.1', () => r((srv.address() as net.AddressInfo).port)))
+
+test('observe: a REAL loopback app is refused by default, observed WITH authorized', async () => {
+  const srv = http.createServer((_req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<html><head><title>Staging</title></head><body><form action="/login" method="post"><input name="pw" type="password"></form></body></html>') })
+  srv.on('error', () => {})
+  const port = await bind(srv)
+  try {
+    const refused = await observe(`http://127.0.0.1:${port}/`)
+    assert.ok(refused.error && /non-public|loopback/i.test(refused.error), 'default: loopback SSRF-refused')
+
+    const ok = await observe(`http://127.0.0.1:${port}/`, { authorized: true })
+    assert.equal(ok.error, undefined, 'authorized: the loopback app is observed, no error')
+    assert.equal(ok.status, 200)
+    assert.ok(ok.forms.length >= 1, 'authorized: parsed the login form on the internal app')
+  } finally { srv.close() }
 })

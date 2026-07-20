@@ -12,10 +12,12 @@ const SEV: Record<string, string> = { critical: '\x1b[41m crit \x1b[0m', high: '
 const HELP = `voyager-browser v${VERSION} — Voyager's web-page sense (read-only)
 
 USAGE
-  voyager-browser observe <url> [--json] [--timeout <ms>] [--max-bytes <n>]
+  voyager-browser observe <url> [--authorized] [--json] [--timeout <ms>] [--max-bytes <n>]
         Observe ONE live page: structure, forms, links, security posture
         (CSP/HSTS/mixed-content) and accessibility signals → findings with
         DESCRIBED (never applied) fixes.
+        --authorized  observe your OWN private/loopback/intranet target (staging,
+                      an internal app); cloud-metadata + link-local stay blocked.
 
   voyager-browser mcp
         Run as an MCP server (stdio) exposing one tool: observe_page.
@@ -28,7 +30,7 @@ private/loopback/cloud-metadata addresses (SSRF-gated). Read-only: it never
 submits a form, clicks, or mutates anything.`
 
 function parseArgs(argv: string[]): { flags: Record<string, string | boolean>; positionals: string[] } {
-  const boolean = new Set(['json'])
+  const boolean = new Set(['json', 'authorized'])
   const flags: Record<string, string | boolean> = {}
   const positionals: string[] = []
   for (let i = 0; i < argv.length; i++) {
@@ -59,6 +61,7 @@ async function main(): Promise<number> {
   const json = flags.json === true
 
   const brief = await observe(url, {
+    authorized: flags.authorized === true,
     timeoutMs: typeof flags.timeout === 'string' ? Number(flags.timeout) || undefined : undefined,
     maxBytes: typeof flags['max-bytes'] === 'string' ? Number(flags['max-bytes']) || undefined : undefined,
     onLog: (l) => { if (!json) console.error(`  · ${l}`) },

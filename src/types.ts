@@ -141,6 +141,10 @@ export interface ObserveOptions {
   timeoutMs?: number
   /** Max bytes of HTML to read (protects against huge pages). */
   maxBytes?: number
+  /** Authorize observing your OWN private/loopback/intranet target (staging, an
+   *  internal app). Permits private ranges but STILL refuses cloud-metadata and
+   *  link-local. Mirrors voyager-net's `authorized`. Default false = public only. */
+  authorized?: boolean
   /** Extra request header pairs (never used to send credentials). */
   onLog?: (line: string) => void
 }

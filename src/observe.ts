@@ -9,16 +9,16 @@ const dnsLookup = promisify(dnsLookupCb)
 
 /** Resolve a host and refuse if ANY resolved address is non-public — the SSRF
  *  gate, applied to the real destination. Returns the single address to PIN. */
-async function resolveSafe(host: string): Promise<{ ip: string | null; reason?: string }> {
+async function resolveSafe(host: string, allowPrivate: boolean): Promise<{ ip: string | null; reason?: string }> {
   if (/^[\d.]+$/.test(host) || host.includes(':')) {
-    const r = blockedIpReason(host)
+    const r = blockedIpReason(host, allowPrivate)
     return r ? { ip: host, reason: r } : { ip: host }
   }
   try {
     const addrs = await dnsLookup(host, { all: true })
     if (!addrs.length) return { ip: null, reason: `could not resolve ${host}` }
     for (const a of addrs) {
-      const r = blockedIpReason(a.address)
+      const r = blockedIpReason(a.address, allowPrivate)
       if (r) return { ip: a.address, reason: `${host} ${r}` }
     }
     return { ip: addrs[0].address }
@@ -47,7 +47,8 @@ export async function observe(input: string, opts: ObserveOptions = {}): Promise
     findings: [], confidence: 'weak', suggestedNextProbes: [], sanitization: { framedFields: 0, strippedPayloads: 0 }, notes: [],
   })
 
-  const decision = parseUrl(input)
+  const allowPrivate = opts.authorized === true
+  const decision = parseUrl(input, { allowPrivate })
   if (!decision.ok || !decision.url || !decision.host) return { ...base(), error: `invalid URL: ${decision.reason}` }
 
   // Follow redirects manually so each hop is re-vetted AND re-pinned.
@@ -58,12 +59,12 @@ export async function observe(input: string, opts: ObserveOptions = {}): Promise
   let tooManyHops = false
   for (let hop = 0; ; hop++) {
     if (hop >= 6) { tooManyHops = true; break }
-    const safe = await resolveSafe(url.hostname.replace(/^\[|\]$/g, ''))
+    const safe = await resolveSafe(url.hostname.replace(/^\[|\]$/g, ''), allowPrivate)
     if (safe.reason) return { ...base(), target: { input, url: url.toString(), origin: url.origin }, resolvedIp: safe.ip, error: safe.reason }
     resolvedIp = safe.ip
     log(`fetching ${url.toString()}…`)
     try {
-      res = await safeGet(url.toString(), { pinnedIp: resolvedIp!, timeoutMs, maxBytes })
+      res = await safeGet(url.toString(), { pinnedIp: resolvedIp!, timeoutMs, maxBytes, allowPrivate })
     } catch (e) {
       return { ...base(), target: { input, url: url.toString(), origin: url.origin }, resolvedIp, error: `fetch failed: ${e instanceof Error ? e.message : String(e)}` }
     }
@@ -77,7 +78,7 @@ export async function observe(input: string, opts: ObserveOptions = {}): Promise
       } catch {
         return { ...base(), target: { input, url: url.toString(), origin: url.origin }, resolvedIp, status: res.status, error: `redirect ${res.status} to a malformed Location — not observed` }
       }
-      const nd = parseUrl(next.toString())
+      const nd = parseUrl(next.toString(), { allowPrivate })
       if (!nd.ok) return { ...base(), target: { input, url: next.toString(), origin: null }, resolvedIp, status: res.status, error: `redirect to a disallowed URL: ${nd.reason}` }
       notes.push(`redirect ${res.status} → ${next.origin}`)
       url = next
@@ -136,7 +137,7 @@ export async function observe(input: string, opts: ObserveOptions = {}): Promise
   const endpoints = new Set<string>()
   for (const srcUrl of structure.scriptSrcs.slice(0, 6)) {
     try {
-      const js = await safeGet(srcUrl, { pinnedIp: resolvedIp!, timeoutMs, maxBytes: 1_500_000 })
+      const js = await safeGet(srcUrl, { pinnedIp: resolvedIp!, timeoutMs, maxBytes: 1_500_000, allowPrivate })
       if (js.status >= 200 && js.status < 300) extractEndpoints(js.body, endpoints)
     } catch {
       /* a bundle that won't fetch is skipped — the rest still run */

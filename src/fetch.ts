@@ -17,6 +17,9 @@ export interface SafeGetOptions {
   pinnedIp: string
   timeoutMs: number
   maxBytes: number
+  /** Authorized internal audit: permit private/loopback pins (still refuses
+   *  cloud-metadata + link-local). Mirrors the observe() `authorized` posture. */
+  allowPrivate?: boolean
 }
 
 /**
@@ -38,7 +41,7 @@ export function safeGet(urlStr: string, opts: SafeGetOptions): Promise<SafeGetRe
   // set, as (err, [{address, family}]) — handle BOTH so the socket never gets an
   // undefined address.
   const lookup = ((hostname: string, options: { all?: boolean } | number, cb: (...a: unknown[]) => void) => {
-    const reason = blockedIpReason(opts.pinnedIp)
+    const reason = blockedIpReason(opts.pinnedIp, opts.allowPrivate)
     if (reason) {
       cb(new Error(`pinned IP ${opts.pinnedIp} ${reason}`))
       return

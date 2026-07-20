@@ -24,7 +24,12 @@ const METADATA_HOSTS = new Set(['169.254.169.254', 'fd00:ec2::254', 'metadata.go
  * addresses (0.0.0.0, ::), CGNAT (100.64/10), NAT64, benchmark/reserved/multicast
  * and every private/loopback/link-local range in one rule.
  */
-export function blockedIpReason(ipStr: string): string | null {
+// Ranges an AUTHORIZED internal audit may reach (allowPrivate): the operator's own
+// private/loopback space. linkLocal is deliberately EXCLUDED (169.254 = metadata
+// surface), as are multicast/broadcast/unspecified/reserved.
+const AUDIT_ALLOWED_RANGES = new Set<string>(['loopback', 'private', 'uniqueLocal', 'carrierGradeNat'])
+
+export function blockedIpReason(ipStr: string, allowPrivate = false): string | null {
   let addr: ipaddr.IPv4 | ipaddr.IPv6
   try {
     addr = ipaddr.parse(ipStr)
@@ -38,11 +43,27 @@ export function blockedIpReason(ipStr: string): string | null {
   }
   if (METADATA_HOSTS.has(addr.toString())) return 'is a cloud metadata endpoint (SSRF/credential-theft surface)'
   const range = addr.range()
-  // 'unicast' is the only public, routable-to-the-internet category. Everything
-  // else — private, loopback, linkLocal, uniqueLocal, unspecified, broadcast,
-  // multicast, carrierGradeNat, reserved, rfc6145/rfc6052 (NAT64), etc. — is out.
-  if (range !== 'unicast') return `resolves to a non-public address (${range})`
-  return null
+  // 'unicast' is the only public, routable-to-the-internet category.
+  if (range === 'unicast') return null
+  // AUTHORIZED internal audit (Kimi web-audit P0 — without this, voyager-browser
+  // cannot even POINT at your own staging/intranet/loopback app). When allowPrivate,
+  // permit the operator's own private ranges but STILL refuse cloud-metadata (above)
+  // and link-local + multicast/broadcast/unspecified/reserved. Mirrors voyager-net's
+  // authorized posture.
+  if (allowPrivate && AUDIT_ALLOWED_RANGES.has(range)) return null
+  return `resolves to a non-public address (${range})`
+}
+
+/** Scope of a literal IP, for the UrlDecision. */
+function scopeOf(ipStr: string): UrlDecision['scope'] {
+  try {
+    let a: ipaddr.IPv4 | ipaddr.IPv6 = ipaddr.parse(ipStr)
+    if (a.kind() === 'ipv6') { const v6 = a as ipaddr.IPv6; if (v6.isIPv4MappedAddress()) a = v6.toIPv4Address() }
+    const r = a.range()
+    if (r === 'loopback') return 'loopback'
+    if (r === 'unicast') return 'public'
+    return 'private'
+  } catch { return 'unknown' }
 }
 
 /**
@@ -51,7 +72,8 @@ export function blockedIpReason(ipStr: string): string | null {
  * A literal IP is classified immediately; hostnames are re-screened after DNS in
  * observe() (and the resolved IP is pinned to the socket to defeat rebinding).
  */
-export function parseUrl(input: string): UrlDecision {
+export function parseUrl(input: string, opts: { allowPrivate?: boolean } = {}): UrlDecision {
+  const allowPrivate = opts.allowPrivate === true
   const raw = (input ?? '').trim()
   if (!raw) return { ok: false, url: null, host: null, origin: null, scope: 'unknown', reason: 'empty URL' }
   if (/[,\s]/.test(raw)) return { ok: false, url: null, host: null, origin: null, scope: 'unknown', reason: 'only a single URL is allowed (no lists or whitespace)' }
@@ -78,9 +100,9 @@ export function parseUrl(input: string): UrlDecision {
   }
   // A literal IP target is classified now — reject non-public immediately.
   if (net.isIP(host)) {
-    const blocked = blockedIpReason(host)
+    const blocked = blockedIpReason(host, allowPrivate)
     if (blocked) return { ok: false, url: null, host, origin: u.origin, scope: 'unknown', reason: `${host} ${blocked}` }
-    return { ok: true, url: u.toString(), host, origin: u.origin, scope: 'public' }
+    return { ok: true, url: u.toString(), host, origin: u.origin, scope: scopeOf(host) }
   }
   return { ok: true, url: u.toString(), host, origin: u.origin, scope: 'unknown' }
 }
