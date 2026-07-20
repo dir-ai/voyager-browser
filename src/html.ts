@@ -115,6 +115,35 @@ export function extractStructure(html: string, pageUrl: URL): {
   const imgCount = imgs.length
   const imgMissingAlt = imgs.filter((t) => attr(t, 'alt') === null).length
 
+  const external = (u: string): string | null => {
+    try { const o = new URL(u, base); return o.origin !== pageUrl.origin && /^https?:$/.test(o.protocol) ? o.origin : null } catch { return null }
+  }
+  // Cross-origin IFRAMES — embedded third parties (data-leak / clickjacking-relay
+  // surface). Sandbox presence matters, so we record it.
+  const iframes: Array<{ origin: string; sandboxed: boolean }> = []
+  for (const m of noComments.matchAll(/<iframe\b[^>]*>/gi)) {
+    const src = attr(m[0], 'src'); if (!src) continue
+    // `sandbox` is a boolean attribute (often valueless), so detect its PRESENCE.
+    const origin = external(src); if (origin) iframes.push({ origin, sandboxed: /\bsandbox\b/i.test(m[0]) })
+  }
+  // Resource HINTS (dns-prefetch/preconnect/preload/prefetch/modulepreload) — the
+  // third-party origins the page deliberately reaches out to.
+  const hintOrigins = new Set<string>()
+  for (const m of noComments.matchAll(/<link\b[^>]*>/gi)) {
+    const rel = (attr(m[0], 'rel') ?? '').toLowerCase()
+    if (!/dns-prefetch|preconnect|preload|prefetch|modulepreload/.test(rel)) continue
+    const href = attr(m[0], 'href'); if (!href) continue
+    const origin = external(href); if (origin) hintOrigins.add(origin)
+  }
+  // srcset third-party origins (responsive images / <source>).
+  const srcsetOrigins = new Set<string>()
+  for (const m of text.matchAll(/<(?:img|source)\b[^>]*\bsrcset\s*=\s*["']([^"']+)["']/gi)) {
+    for (const cand of m[1].split(',')) {
+      const url = cand.trim().split(/\s+/)[0]; if (!url) continue
+      const origin = external(url); if (origin) srcsetOrigins.add(origin)
+    }
+  }
+
   // Signals for honest SPA/client-render detection.
   const bodyText = text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
   const mountNode = /<(?:div|main)\b[^>]*\bid\s*=\s*["'](?:root|app|__next|__nuxt|q-app|svelte)["']/i.test(text)
@@ -133,6 +162,9 @@ export function extractStructure(html: string, pageUrl: URL): {
     generator,
     visibleTextLength: bodyText.length,
     hasMountNode: mountNode,
+    iframes,
+    resourceHintOrigins: [...hintOrigins],
+    srcsetOrigins: [...srcsetOrigins],
   }
 
   // Forms — from rendered markup only (no comments/scripts).

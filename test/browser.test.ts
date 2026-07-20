@@ -167,3 +167,23 @@ test('Kimi: target="_BLANK" (any case) is caught for reverse-tabnabbing', () => 
   const { links } = extractStructure('<a href="https://other.test/x" target="_BLANK">x</a>', new URL('https://me.test/'))
   assert.equal(links[0].unsafeBlank, true)
 })
+
+// Round-3: embedded third-party surface (iframes, resource hints, srcset).
+test('extractStructure: cross-origin iframes, resource hints and srcset origins are captured', () => {
+  const html = `<html><head>
+    <link rel="preconnect" href="https://hints.cdn.example/">
+    <link rel="dns-prefetch" href="https://track.evil.example/">
+  </head><body>
+    <iframe src="https://embed.other.example/widget"></iframe>
+    <iframe src="https://safe.example/x" sandbox></iframe>
+    <img srcset="https://img.cdn.example/a.jpg 1x, /local.jpg 2x">
+    <iframe src="/same-origin"></iframe>
+  </body></html>`
+  const { structure } = extractStructure(html, new URL('https://site.example/'))
+  const iframeOrigins = structure.iframes.map((i) => i.origin)
+  assert.ok(iframeOrigins.includes('https://embed.other.example'), 'cross-origin iframe captured')
+  assert.ok(structure.iframes.some((i) => i.origin === 'https://safe.example' && i.sandboxed), 'sandbox flag recorded')
+  assert.ok(!iframeOrigins.includes('https://site.example'), 'same-origin iframe excluded')
+  assert.ok(structure.resourceHintOrigins.includes('https://track.evil.example'), 'resource hint origin captured')
+  assert.ok(structure.srcsetOrigins.includes('https://img.cdn.example'), 'srcset third-party origin captured')
+})

@@ -176,6 +176,11 @@ export async function observe(input: string, opts: ObserveOptions = {}): Promise
   if (mixedContent.length) findings.push(f('high', 'mixed-content', `${mixedContent.length} insecure http:// sub-resource(s) on an HTTPS page`, mixedContent[0], 'load all sub-resources over HTTPS'))
   for (const c of insecureCookies.slice(0, 5)) findings.push(f('medium', 'weak-cookie', `cookie "${c}" missing Secure and/or HttpOnly`, url.origin, 'set Secure + HttpOnly (and SameSite) on cookies'))
   if (structure.externalScriptsNoSri > 0) findings.push(f('low', 'missing-sri', `${structure.externalScriptsNoSri} third-party <script> without Subresource Integrity`, url.origin, 'add integrity + crossorigin to third-party scripts', 'moderate'))
+  for (const fr of structure.iframes.slice(0, 8)) findings.push(f(fr.sandboxed ? 'info' : 'medium', fr.sandboxed ? 'embedded-frame' : 'embedded-frame-unsandboxed', `embeds cross-origin ${fr.origin} in an iframe${fr.sandboxed ? ' (sandboxed)' : ' WITHOUT sandbox — full-privilege third-party frame'}`, fr.origin, fr.sandboxed ? 'confirm the embedded third party is intended' : "add a sandbox attribute and restrict allowed capabilities", 'moderate'))
+  // Inventory the FULL embedded third-party surface (scripts + iframes + hints +
+  // srcset), so "who does this page pull in?" is answered, not just script hosts.
+  const thirdParties = [...new Set([...thirdPartyScripts, ...structure.iframes.map((i) => i.origin), ...structure.resourceHintOrigins, ...structure.srcsetOrigins])]
+  if (thirdParties.length) findings.push(f('info', 'third-party-origins', `page pulls in ${thirdParties.length} third-party origin(s): ${thirdParties.slice(0, 10).join(', ')}`, url.origin, 'vet each third-party origin (voyager-net/voyager) and minimize embedded parties', 'moderate'))
 
   for (const fo of forms) {
     if (fo.insecureTarget) findings.push(f('critical', 'form-insecure', `form on an HTTPS page posts to a plain-HTTP target (${fo.action})`, fo.action, 'point the form action at an HTTPS endpoint'))

@@ -67,6 +67,14 @@ export interface PageStructure {
   visibleTextLength: number
   /** A single SPA mount node (#root/#app/#__next…) was found. */
   hasMountNode: boolean
+  /** Cross-origin <iframe> embeds (with sandbox presence) — third parties given a
+   *  frame on the page (data-leak / clickjacking-relay surface). */
+  iframes: Array<{ origin: string; sandboxed: boolean }>
+  /** Third-party origins the page hints it will reach (dns-prefetch/preconnect/
+   *  preload/prefetch). */
+  resourceHintOrigins: string[]
+  /** Third-party origins referenced from img/source srcset. */
+  srcsetOrigins: string[]
 }
 
 export interface SecurityPosture {
